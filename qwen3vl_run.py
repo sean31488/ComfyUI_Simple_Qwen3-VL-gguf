@@ -444,9 +444,15 @@ def _stream_chat_completion(llm, messages, completion_kwargs, debug=False):
 def _inference(config):
     """Внутренняя функция, выполняющая инференс с кешированием модели."""
     try:
-        debug = config.get("debug", True)
+        debug = config.get("debug", False)
         verbose = config.get("verbose", False)
         streaming_mode = config.get("streaming_mode", False)
+
+        # Native llama-server backend (utils.Llama adapter)
+        use_native_llamacpp = bool(config.get("llama_server_path"))
+        if use_native_llamacpp and streaming_mode:
+            print("[native-llama.cpp] streaming_mode is not supported, disabled", file=sys.stderr)
+            streaming_mode = False
 
         chat_handler_type = _norm_str(config.get("chat_handler"))
         chat_format = _norm_str(config.get("chat_format"))
@@ -513,6 +519,8 @@ def _inference(config):
 
         if extract_embedding:
             from llama_cpp.llama_embedding import LlamaEmbedding, LLAMA_POOLING_TYPE_NONE
+        elif use_native_llamacpp:
+            from utils import Llama
         else: 
             from llama_cpp import Llama
 
@@ -541,7 +549,7 @@ def _inference(config):
 
             chat_handler = None
 
-            if is_vision_model:
+            if is_vision_model and not use_native_llamacpp:
                 t0 = time.perf_counter()
 
                 if not chat_handler_type:
@@ -742,6 +750,9 @@ def _inference(config):
                     if key.startswith("extra_llama_"):
                         new_key = key[len("extra_llama_"):]
                         llm_kwargs[new_key] = value
+
+                if use_native_llamacpp:
+                    llm_kwargs["_native_config"] = config
 
                 ### SPECULATIVE ###
                 # 0=NONE - no speculative decoding
@@ -1328,7 +1339,7 @@ def main():
                 pickle.dump(data_type, f)
                 data_path = f.name    
             result["data_file"] = data_path
-            debug = config.get("debug", True)
+            debug = config.get("debug", False)
             _debug_print(debug, "save data", t_save_data, file=sys.stderr)
    
         restore_dup()

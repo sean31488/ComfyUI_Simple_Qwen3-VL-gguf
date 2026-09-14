@@ -568,7 +568,7 @@ def run_script_subprocess(script_name, config, timeout=300):
             }
 
         if process.returncode == 0:
-            debug = config.get("debug", True)
+            debug = config.get("debug", False)
             if debug and stderr:
                 print(f"{stderr}", file=sys.stderr)
             return output_data
@@ -977,7 +977,7 @@ class SimpleQwen3VL_GGUF_Node:
 
             # Получаем имя скрипта
             script_name = config.get("script", "qwen3vl_run.py")
-            debug = config.get("debug", True)
+            debug = config.get("debug", False)
             gccollect_start = config.get("force_gc_start", False)
             gccollect = config.get("force_gc_unload", False)
 

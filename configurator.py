@@ -103,7 +103,7 @@ _ADVANCED_DEFAULTS = {
     "add_audio_id": "",
     # debug / system
     "verbose": False,
-    "debug": True,
+    "debug": False,
     "debug_output": False,
     "raw_output": False,
     "streaming_mode": False,
@@ -796,7 +796,7 @@ class Qwen3VL_AdvancedConfig:
                     "tooltip": "Enables verbose logging from llama.cpp.",
                 }),
                 "debug": ("BOOLEAN", {
-                    "default": True,
+                    "default": False,
                     "tooltip": "Enables timing output for each stage to the console.",
                 }),
                 "debug_output": ("BOOLEAN", {
@@ -979,7 +979,7 @@ class Qwen3VL_AdvancedConfig:
 
             # debug / system
             "verbose": g("verbose", False),
-            "debug": g("debug", True),
+            "debug": g("debug", False),
             "debug_output": g("debug_output", False),
             "clearing_cache": g("clearing_cache", True),
             "force_gc_start": g("force_gc_start", False),
@@ -1550,7 +1550,7 @@ class Qwen3VL_ModelConfig:
                 
                 # === ОПЦИОНАЛЬНЫЕ: Отладка ===
                 "verbose": ("BOOLEAN", {"default": False, "tooltip": "Verbose llama.cpp logging"}),
-                "debug": ("BOOLEAN", {"default": True, "tooltip": "Output timing info to console"}),
+                "debug": ("BOOLEAN", {"default": False, "tooltip": "Output timing info to console"}),
 
                 "type_k": (list(GGML_TYPES_OLD.keys()), {"default": "F16"}),
                 "type_v": (list(GGML_TYPES_OLD.keys()), {"default": "F16"}),
