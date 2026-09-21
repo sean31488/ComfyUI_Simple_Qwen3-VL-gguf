@@ -13,7 +13,7 @@ const GROUP_HEADERS = [
     "📝 Prompt Template",
     "🖼️ Multimodal & Media",
     "⚡ Speculative Decoding",
-    "🔢 Embeddings",
+    "🔢 Embeddings & TTS",
     "🛠️ Debug, System & Advanced"
 ];
 const HEADER_COLORS = {
@@ -25,20 +25,20 @@ const HEADER_COLORS = {
     "📝 Prompt Template": "#d946ef",
     "🖼️ Multimodal & Media": "#06b6d4",
     "⚡ Speculative Decoding": "#eab308",
-    "🔢 Embeddings": "#6366f1",
+    "🔢 Embeddings & TTS": "#6366f1",
     "🛠️ Debug, System & Advanced": "#71717a"
 };
 const HEADER_DEFAULT_COLOR = "#3a6ea5";
 const GROUP_FIELDS = {
     "📁 Model & Paths": ["model_path", "mmproj_path"],
     "🗄️ Memory & Context": ["n_ctx", "n_batch", "n_ubatch", "n_keep", "offload_kqv", "type_k", "type_v", "use_mmap", "use_mlock", "pool_size", "logits_all", "swa_full"],
-    "🎲 Sampling & Generation": ["max_tokens", "temperature", "top_p", "min_p", "top_k", "repeat_penalty", "presence_penalty", "frequency_penalty", "enable_thinking", "remove_thinking", "force_reasoning", "words_to_ban"],
+    "🎲 Sampling & Generation": ["max_tokens", "temperature", "top_p", "min_p", "top_k", "repeat_penalty", "presence_penalty", "frequency_penalty", "enable_thinking", "remove_thinking", "answer_delimiter", "force_reasoning", "words_to_ban"],
     "⚙️ Hardware & Acceleration": ["n_gpu_layers", "n_cpu_moe", "cpu_moe", "n_threads", "flash_attn_type", "split_mode", "main_gpu", "cuda_device", "tensor_split"],
     "💬 Chat, Prompts & Variables": ["chat_handler", "chat_format", "chat_format_from_gguf", "system_prompt_default", "system_preset_to_user_prompt", "user_prompt_after_content", "enable_variables", "add_vision_id", "add_image_id", "add_frame_id", "add_audio_id"],
     "📝 Prompt Template": ["raw_mode", "prompt_template", "stop"],
     "🖼️ Multimodal & Media": ["force_mmproj", "image_min_tokens", "image_max_tokens", "max_images", "max_frames", "max_audios", "audio_sample_rate", "image_quality", "frame_quality"],
     "⚡ Speculative Decoding": ["speculative_enabled", "speculative_type", "draft_n_max", "draft_p_min", "draft_model_path", "draft_n_gpu_layers", "draft_backend_sampling", "ngram_size_n", "ngram_size_m", "ngram_min_hits", "ngram_max_entries_per_key", "ctx_checkpoints", "checkpoint_on_device"],
-    "🔢 Embeddings": ["extract_embedding", "pooling_type", "tokenizer_path", "embedding_scale", "convert_emb_to_cond"],
+    "🔢 Embeddings & TTS": ["extract_embedding", "pooling_type", "tokenizer_path", "embedding_scale", "convert_emb_to_cond", "extract_tts", "mmproj_use_gpu", "mmproj_flash_attn","mmproj_batch_max_tokens", "language"],
     "🛠️ Debug, System & Advanced": ["verbose", "debug", "debug_output", "raw_output", "streaming_mode", "clearing_cache", "force_gc_start", "force_gc_unload", "script", "extra"]
 };
 const LEGACY_ORDER = [
@@ -228,8 +228,13 @@ app.registerExtension({
                     origPresetCb?.call(presetCombo, value);
                     if (value && value !== "None") {
                         const cfg = await fetchPresetConfig(value);
-                        if (cfg) applyPreset(this, cfg);
+                        if (cfg) {
+                            resetWidgetsToDefaults(this);       // сброс в дефолт
+                            applyPreset(this, cfg);             // накладываем значения пресета
+                        }
                     } else {
+                        // При выборе "None" — тоже сбрасываем в дефолт
+                        resetWidgetsToDefaults(this);
                         applyPreset(this, null);
                     }
                 };
@@ -276,6 +281,20 @@ function insertWidgetsAfter(node, target, widgets) {
     if (idx < 0) return;
     node.widgets = node.widgets.filter(w => !widgets.includes(w));
     node.widgets.splice(idx + 1, 0, ...widgets);
+}
+
+function resetWidgetsToDefaults(node) {
+    const defaults = node._widgetDefaults || {};
+    for (const w of node.widgets) {
+        if (w.skipSerialize) continue;
+        if (["model_preset", "preset_name", "preset_controls", "group_toggle_panel"].includes(w.name)) continue;
+        if (GROUP_HEADERS.includes(w.name)) continue;
+        if (w.type === "button") continue;
+        if (w.name === "extra") { w.value = ""; continue; }
+        if (Object.prototype.hasOwnProperty.call(defaults, w.name)) {
+            w.value = convertValue(w.name, defaults[w.name], w);
+        }
+    }
 }
 
 function setBaselineFromPreset(node, presetConfig) {
@@ -795,19 +814,8 @@ async function onImportJson(node, combo) {
                 const resetOthers = options.resetOthers !== false; // по умолчанию true
 
                 if (resetOthers) {
-                    const defaults = node._widgetDefaults || {};
-                    for (const w of node.widgets) {
-                        if (w.skipSerialize) continue;
-                        if (["model_preset", "preset_name", "preset_controls", "group_toggle_panel"].includes(w.name)) continue;
-                        if (GROUP_HEADERS.includes(w.name)) continue;
-                        if (w.type === "button") continue;
-                        if (w.name === "extra") { w.value = ""; continue; }
-                        if (Object.prototype.hasOwnProperty.call(defaults, w.name)) {
-                            w.value = convertValue(w.name, defaults[w.name], w);
-                        }
-                    }
+                    resetWidgetsToDefaults(node);
                 }
-
                 applyPreset(node, config, false);
 
                 // Обновляем dirty state
@@ -1125,7 +1133,7 @@ function createGroupTogglePanel(hostNode) {
         { icon: "📝", name: "📝 Prompt Template", title: "Prompt Template" },
         { icon: "🖼️", name: "🖼️ Multimodal & Media", title: "Multimodal & Media" },
         { icon: "⚡", name: "⚡ Speculative Decoding", title: "Speculative Decoding" },
-        { icon: "🔢", name: "🔢 Embeddings", title: "Embeddings" },
+        { icon: "🔢", name: "🔢 Embeddings & TTS", title: "Embeddings & TTS" },
         { icon: "🛠️", name: "🛠️ Debug, System & Advanced", title: "Debug, System & Advanced" },
     ];
     const buttons = [];

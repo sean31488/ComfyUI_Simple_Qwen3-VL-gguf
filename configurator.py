@@ -43,6 +43,7 @@ _ADVANCED_DEFAULTS = {
     "words_to_ban": "",
     "enable_thinking": False,
     "remove_thinking": False,
+    "answer_delimiter": "",
     "force_reasoning": False,
     # gpu / offload / multi-gpu
     "n_gpu_layers": -1,
@@ -96,6 +97,12 @@ _ADVANCED_DEFAULTS = {
     "tokenizer_path": "",
     "embedding_scale": 1.0,
     "convert_emb_to_cond": False,
+    # tts
+    "extract_tts": False,
+    "mmproj_use_gpu": True,
+    "mmproj_flash_attn": True,
+    "mmproj_batch_max_tokens": 1024,
+    "language": "",
     # variables / ids
     "enable_variables": False,
     "add_image_id": "",
@@ -449,6 +456,11 @@ class Qwen3VL_AdvancedConfig:
                     "default": False,
                     "tooltip": "Remove <think>...</think> or <|channel>...<channel|> section in text",
                 }),
+                "answer_delimiter": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Use this for non-standard models to clean up the output. Enter the token where the real answer starts, and the node will automatically cut out all thinking processes and technical tags generated prior to it.",
+                }),
                 "force_reasoning": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "For Qwen3: force reasoning mode even on simple queries.",
@@ -753,9 +765,9 @@ class Qwen3VL_AdvancedConfig:
                 # ==================================================
                 # GROUP 9: EMBEDDINGS
                 # ==================================================
-                "🔢 Embeddings": ("BOOLEAN", {
+                "🔢 Embeddings & TTS": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Show/hide group: embedding extraction mode (replaces text generation).",
+                    "tooltip": "Show/hide group: embedding/TTS extraction mode (replaces text generation).",
                 }),
                 "extract_embedding": ("BOOLEAN", {
                     "default": False,
@@ -783,7 +795,31 @@ class Qwen3VL_AdvancedConfig:
                     "default": False,
                     "tooltip": "Wrap the raw embedding into a ComfyUI CONDITIONING structure (hidden_states + attention_mask). Required for passing embeddings into SD/Flux conditioning slots.",
                 }),
-
+                #TTS
+                "extract_tts": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Switch node to TTS (Text-to-Speech) mode. When enabled, the node generates audio from text instead of user_prompt text. Requires mmproj_path and a TTS-compatible model.",
+                }),
+                "mmproj_use_gpu": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Use GPU for mmproj (multimodal projector). Disable for CPU-only inference (slower but works without CUDA).",
+                }),
+                "mmproj_flash_attn": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable Flash Attention for mmproj (multimodal projector). Improves performance on supported GPUs. Disable if you encounter compatibility issues.",
+                }),
+                "mmproj_batch_max_tokens": ("INT", {
+                    "default": 1024,
+                    "min": 0,
+                    "max": 1048576,
+                    "step": 1,
+                    "tooltip": "Maximum batch size for the multimodal projector (mmproj). Multimodal tasks require more VRAM per token than standard text, so this value is typically lower than n_batch. Reduce if VRAM is insufficient (to 512 or 256) or increase for faster processing if memory allows.",
+                }),
+                "language": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "tooltip": "Language code for TTS generation (zh, en, de, it, pt, es, ja, ko, fr, ru). Leave empty for auto-detection or model default. Note: model must support the specified language.",
+                }),
                 # ==================================================
                 # GROUP 10: DEBUG / SYSTEM
                 # ==================================================
@@ -927,6 +963,7 @@ class Qwen3VL_AdvancedConfig:
             "chat_format_from_gguf": g("chat_format_from_gguf", False),
             "enable_thinking": g("enable_thinking", False),
             "remove_thinking": g("remove_thinking", False),
+            "answer_delimiter": g("answer_delimiter", ""),
             "force_reasoning": g("force_reasoning", False),
             "system_prompt_default": g("system_prompt_default", ""),
             "system_preset_to_user_prompt": g("system_preset_to_user_prompt", False),
@@ -970,6 +1007,13 @@ class Qwen3VL_AdvancedConfig:
             "tokenizer_path": g("tokenizer_path", ""),
             "embedding_scale": g("embedding_scale", 1.0),
             "convert_emb_to_cond": g("convert_emb_to_cond", False),
+
+            #TTS
+            "extract_tts": g("extract_tts", False),
+            "mmproj_use_gpu": g("mmproj_use_gpu", True),
+            "mmproj_flash_attn": g("mmproj_flash_attn", True),
+            "mmproj_batch_max_tokens": g("mmproj_batch_max_tokens", 1024),
+            "language": g("language", ""),
 
             # variables / ids
             "enable_variables": g("enable_variables", False),
