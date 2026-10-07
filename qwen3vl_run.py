@@ -1088,11 +1088,16 @@ def _inference(config):
                     if not user_prompt_after_content:
                         content.append({"type": "text", "text": user_prompt})
 
-                    num = 0
+                    num = 1
+                    image_slots = config.get("image_slots") or []
                     for img_item in images:
                         img_content = _build_image_content(img_item, quality=image_quality)
                         if img_content is not None:
-                            if image_id:
+                            if isinstance(image_id, dict):
+                                slot = image_slots[num - 1] if num <= len(image_slots) else None
+                                if image_id.get(slot):
+                                    content.append({"type": "text", "text": image_id[slot]})
+                            elif image_id:
                                 content.append({"type": "text", "text": image_id.replace("{num}", str(num))})
                             content.append(img_content)     
                             num += 1                   

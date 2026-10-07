@@ -1020,12 +1020,14 @@ class SimpleQwen3VL_GGUF_Node:
 
             # Собираем все входы
             input_images = []
+            image_slots = []
             input_audios = []
             input_videos = []
 
             # Legacy входы
             if kwargs.get("image") is not None:
                 input_images.append(kwargs["image"])
+                image_slots.append("image")
             if kwargs.get("audio") is not None:
                 input_audios.append(kwargs["audio"])
             if kwargs.get("video") is not None:
@@ -1039,6 +1041,7 @@ class SimpleQwen3VL_GGUF_Node:
                 if key.startswith("image") and key[5:].isdigit():
                     if kwargs[key] is not None:
                         input_images.append(kwargs[key])
+                        image_slots.append(key)
                 elif key.startswith("audio") and key[5:].isdigit():
                     if kwargs[key] is not None:
                         input_audios.append(kwargs[key])
@@ -1192,6 +1195,7 @@ class SimpleQwen3VL_GGUF_Node:
                 "user_prompt": user_prompt,
                 "system_prompt": system_prompt,
                 "images": images_value,
+                "image_slots": image_slots,
                 "audios": audio_value,
                 "videos": video_value,
                 "seed": seed,
