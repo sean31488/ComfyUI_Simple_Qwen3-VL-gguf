@@ -214,6 +214,14 @@ class Llama:
         self._ctx = self
         self._closed = False
         self._force_no_cache_next = False
+        self._process = None
+        self._model = native_config.get("llama_server_model")
+
+        # Connect to an already running OpenAI-compatible server instead of spawning one.
+        llama_server_url = native_config.get("llama_server_url")
+        if llama_server_url:
+            self._base_url = str(llama_server_url).rstrip("/")
+            return
 
         self._exe = self._resolve_server_executable(native_config.get("llama_server_path"))
         self._host = "127.0.0.1"
@@ -507,6 +515,7 @@ class Llama:
         # llama-server blocks arbitrary file:// access unless --media-path is set,
         # so inline local media into the request as data: URLs instead.
         payload = self._inline_local_media(payload)
+        self._put(payload, "model", self._model)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             self._base_url + endpoint,
@@ -523,7 +532,7 @@ class Llama:
                 f"llama-server {endpoint} failed: HTTP {exc.code}: {body}"
             ) from exc
         except Exception as exc:
-            if self._process.poll() is not None:
+            if self._process is not None and self._process.poll() is not None:
                 raise RuntimeError(
                     f"llama-server exited with code {self._process.returncode}: {exc}"
                 ) from exc

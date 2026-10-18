@@ -449,7 +449,8 @@ def _inference(config):
         streaming_mode = config.get("streaming_mode", False)
 
         # Native llama-server backend (utils.Llama adapter)
-        use_native_llamacpp = bool(config.get("llama_server_path")) and not config.get("extract_tts", False)
+        llama_server_url = config.get("llama_server_url")
+        use_native_llamacpp = bool(config.get("llama_server_path") or llama_server_url) and not config.get("extract_tts", False)
         if use_native_llamacpp and streaming_mode:
             print("[native-llama.cpp] streaming_mode is not supported, disabled", file=sys.stderr)
             streaming_mode = False
@@ -467,7 +468,7 @@ def _inference(config):
 
         # --- Проверка обязательных полей ---
         model_path = config.get("model_path", "").strip()
-        if not model_path:
+        if not model_path and not llama_server_url:
             return {"status": "error", "message": "Missing or invalid field: model_path"}, None
 
         system_prompt = config.get("system_prompt", "").strip()
@@ -538,7 +539,7 @@ def _inference(config):
         _debug_print(debug, "import llama_cpp", t0, file=sys.stderr)
 
         mmproj_path = config.get("mmproj_path", "").strip()
-        is_vision_model = bool(num_content > 0 and mmproj_path and extract_embedding == False)
+        is_vision_model = bool(num_content > 0 and (mmproj_path or llama_server_url) and extract_embedding == False)
 
         if config.get("force_mmproj", True) and mmproj_path:
             is_vision_model = True
@@ -1090,13 +1091,17 @@ def _inference(config):
 
                     num = 1
                     image_slots = config.get("image_slots") or []
+                    template_counts = {}
                     for img_item in images:
                         img_content = _build_image_content(img_item, quality=image_quality)
                         if img_content is not None:
                             if isinstance(image_id, dict):
                                 slot = image_slots[num - 1] if num <= len(image_slots) else None
-                                if image_id.get(slot):
-                                    content.append({"type": "text", "text": image_id[slot]})
+                                template = image_id.get(slot)
+                                if template:
+                                    # {num} counts images sharing the same template, across slots and batches
+                                    template_counts[template] = template_counts.get(template, 0) + 1
+                                    content.append({"type": "text", "text": template.replace("{num}", str(template_counts[template]))})
                             elif image_id:
                                 content.append({"type": "text", "text": image_id.replace("{num}", str(num))})
                             content.append(img_content)     

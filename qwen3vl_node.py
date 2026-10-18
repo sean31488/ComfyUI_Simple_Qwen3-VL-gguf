@@ -1059,7 +1059,12 @@ class SimpleQwen3VL_GGUF_Node:
             if input_images:
                 t_process_images = time.perf_counter()
                 max_images = config.get("max_images", 10)
-                images_value = process_images(input_images, file_mode=file_mode, max_images=max_images)
+                # One slot name per produced image, so batches keep their slot's add_image_id label
+                input_slots, image_slots = image_slots, []
+                for slot, img in zip(input_slots, input_images):
+                    values = process_images([img], file_mode=file_mode, max_images=max_images - len(images_value))
+                    images_value += values
+                    image_slots += [slot] * len(values)
                 if file_mode:
                     temp_paths += images_value
                 _debug_print(debug, "process_images", t_process_images)
