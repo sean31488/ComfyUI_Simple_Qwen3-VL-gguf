@@ -1,6 +1,4 @@
-<img width="2048" height="448" alt="15184-43452264163153+" src="https://github.com/user-attachments/assets/92b22216-aa55-4411-8718-8ec82e1b88b6" />
-
-Simple gguf LLM Qwen3-VL, Qwen3.5-3.8, Gemma4 and others model loader for Comfy-UI.
+Simple gguf LLM JoyCaption, Qwen3-3.8, Gemma4, Muse-Glimmer and others model loader for Comfy-UI.
 
 # Why need this version?
 This version was created to meet my requirements:
@@ -15,12 +13,18 @@ In the latest update added a new `keep_vram` mode, which allows you to keep the 
 
 **Nightly (tests)**
 
+- Add new batch modes.
+- Add multimodal embedder.
+- Support for a new generic handler.
+- Group collapse redirects widget links to a fixed anchor point.
+- Centralized chat handler selection + Unified streaming + Text prompt builder + Refactored text modes. Thanks @phazei
+- Name-based serialization fix
+- Native video mode with ffmpeg
+- Memory-free endpoint for the cleanup button
 - Add Qwen3-TTS audio output + configurations.
 - Add `answer_delimiter` config.
 - Add `streaming_mode`, refactor subprocess mode - the process is now interruptible.
-- Add speculative decoding
-> ⚠️ **Important Limitations**: Incompatible with multimodal inputs (images, video, audio), requires `llama-cpp-python` version 0.3.48 or higher, disabled by default.
-
+- Add speculative decoding, requires `llama-cpp-python` version 0.4.3 or higher. 
 - Add dynamic image, audio, video input, Add "user_prompt_template" input, Add "bypass" input
 - New design for LLM Config
 - **Added new configurator 🌐 LLM Config and 🌐 LLM Prompt Preset**
@@ -341,7 +345,55 @@ A universal version. The model and its parameters mast be passed to the `config_
 | subprocess | Inference runs in a separate Python process. The model is loaded and unloaded for each execution. |	✅ Complete isolation – no VRAM leaks. ✅ Safe main script - no crash. 💡 Frees VRAM after each use. |
 | direct_clean | Inference runs in the main ComfyUI process. The model is cached between calls, but unloaded immediately after each inference (VRAM freed). Images are transmitted directly (no temporary files).	| ✅ Faster than subprocess (no process spawn overhead). 💡 Still frees VRAM after each use. |
 | keep_vram | Inference runs in the main ComfyUI process. The model stays loaded in VRAM after the first inference, and is reused for subsequent calls with the same config hash. |	✅ Maximum speed for batch processing or iterative workflows. 💡 When switching the mode to `direct_clean` or `subprocess`, this cache will be unloaded. | 
-| save1-save3 | Allows you to keep the model in VRAM for a long time, if it makes sense. The difference with the `keep_vram` mode is that the model is not cleared after switching modes, and the only way to unload the model is to use the `UnloadQwenModel` node and unload a specific cache or all caches. | ✅ Suitable for storing small models in memory, such as local translators or embedders. 💡 The main thing is to remember unload model manually from VRAM when no longer needed. | 
+| save1-save3 | Allows you to keep the model in VRAM for a long time, if it makes sense. The difference with the `keep_vram` mode is that the model is not cleared after switching modes, and the only way to unload the model is to use the `Simple Qwen Unload` node and unload a specific cache or all caches. A "vacuum cleaner" also clears out all the memory. | ✅ Suitable for storing small models in memory, such as local translators or embedders. 💡 The main thing is to remember unload model manually from VRAM when no longer needed. | 
+| direct_clean_batch | ⚠️ EXPERIMENTAL (see description below). Runs in the main process. Accumulates Part A outputs across the queue and flushes them to Part B either on the last queued task or every batch_limit items. Model is unloaded after the final flush. | Huge speedup for "analyze N images → render N results" workflows. The whole queue is processed with a single model load. |
+| keep_vram_batch | Same as direct_clean_batch, but the model stays in VRAM after the final flush, ready for the next batch with the same config hash. | Useful when the node's own inputs are also batched, or when you chain multiple batch runs. Requires an explicit Simple Qwen Unload step afterwards to free VRAM. |
+
+<details>
+
+<summary>Batch Modes — How They Work</summary>
+
+Standard mode (e.g. direct_clean):
+```
+LLM₁ → render₁ → LLM₂ → render₂ → … → LLM₂₀ → render₂₀
+```
+If an LLM and a rendering model cannot both fit into memory at the same time, they have to be loaded and unloaded repeatedly—which is slow and inefficient.
+The core idea is to change the order of processing without making any significant alterations to the workflow.
+
+Batch mode (*_batch):
+```
+LLM₁ → LLM₂ → … → LLM₂₀   →   render₁ → render₂ → … → render₂₀
+      (Part A)                        (Part B)
+```
+In this mode, 19 renders will be skipped until the 20 LLMs are finished, and all 20 renders will be performed only on the final iteration.
+If there is only one task in the queue, the behavior will be no different from the standard one.
+If additional tasks are added to the queue while processing is underway, they will automatically be grouped into new batches.
+If the queue is cleared, all accumulated tasks will be executed during the final iteration.
+The batch size is configured via config_override. It defaults to 20, meaning that after every 20 LLM calls, the process will continue and 20 render operations will be triggered.
+
+However, this setup has 4 drawbacks:
+1. You cannot mix different workflows in this mode into a single queue, as the results will become unpredictably intermingled.
+2. The queue in ComfyUI will show 19 failed executions.
+3. The final execution will take a long time, as it involves processing all the accumulated results at once. It will not be possible to cancel the execution of individual parts - only the entire batch.
+4. The previous level of flexibility in configuring workflows is no longer available. For example, if you add 5 tasks to the queue, then change the rendering settings (in Part B) and add another 5 tasks, the original settings for the first 5 tasks will be lost. To avoid this, you must pass the settings through a "pipe" from Part A to Part B; this ensures that each individual task retains its own unique parameters.
+
+Passing data from Part A to Part B
+Use the pipe input/output. Whatever you feed into pipe on task i is accumulated together with the text and delivered as a list to Part B. Pack/unpack with Crystools' Pipe to any / Pipe from any — e.g. to carry a unique image per task:
+```
+LoadImage → Pipe to any → [pipe]  SQVLM  [pipe] → Pipe from any → UseImage
+```
+
+⚠️ **Limitations**:
+No concurrent workflows. Do not run any other workflow or node in parallel while a *_batch run is in progress — the shared accumulator will mix results.
+One batch node per workflow. Using multiple *_batch nodes in the same graph is not supported.
+
+Controls for *_batch modes (set via config_override)
+| Key | Values | Default | Meaning |
+|--------|--------|--------|--------|
+| batch_limit | int | 20 | Flush accumulated results every N tasks, even if the queue is not empty. |
+| interrupt_mode | str | interrupt | How intermediate tasks are stopped. "interrupt" marks them as "failed" in history. "blocking" uses ExecutionBlocker, but for me, this runs more slowly. |
+
+</details>
 
 </details>
 
@@ -685,6 +737,31 @@ Allows select a user prompt from templates:
 # Models (for example):
 
 <img width="2048" height="448" alt="03522-929995336568847" src="https://github.com/user-attachments/assets/0dc6c148-c049-4fc4-9363-eedb04db2785" />
+
+<details>
+
+<summary>Flux3 Prompt Enchancer</summary>
+
+- https://huggingface.co/prithivMLmods/flux-3-image-klein-prompt-upsampler-GGUF
+
+```json
+{
+  "model_path": "I:\\LLM\\flux3\\flux-3-image-klein-pup.Q4_K_M.gguf",
+  "mmproj_path": "I:\\LLM\\flux3\\flux-3-image-klein-pup.mmproj-bf16.gguf",
+  "max_tokens": 3584,
+  "top_p": 0.95,
+  "min_p": 0,
+  "top_k": 20,
+  "repeat_penalty": 1,
+  "chat_handler": "generic",
+  "force_mmproj": false,
+  "video_mode": "native",
+  "video_timestamp_interval_ms": 1000,
+  "streaming_mode": true
+}
+```
+
+</details>
 
 <details>
 
@@ -1476,6 +1553,58 @@ https://huggingface.co/Tongyi-MAI/Z-Image-Turbo/tree/main/tokenizer.
     "tokenizer_path": "I:\\LLM\\encoder\\Z-Image-Turbo-HF\\tokenizer",
     "embedding_scale": 100.0,
     "convert_emb_to_cond": true
+}
+```
+
+</details>
+
+<details>
+
+<summary>Qwen3-VL-Embedding-8B (mtmd-encoder)</summary>
+
+- https://huggingface.co/mradermacher/Qwen3-VL-Embedding-8B-i1-GGUF
+
+```json
+{
+  "model_path": "I:\\LLM\\embedding\\Qwen3-VL-Embedding\\Qwen3-VL-Embedding-8B.i1-Q4_K_M.gguf",
+  "mmproj_path": "I:\\LLM\\embedding\\Qwen3-VL-Embedding\\Qwen3-VL-Embedding-8B.mmproj-f16.gguf",
+  "n_batch": 8192,
+  "n_ubatch": 8192,
+  "system_prompt_default": "Represent the user's input.",
+  "raw_mode": true,
+  "prompt_template": "<|im_start|>system\\n{system}<|im_end|>\\n<|im_start|>user\\n{images}{user}<|im_end|>\\n<|im_start|>assistant\\n",
+  "force_mmproj": false,
+  "image_min_tokens": 1024,
+  "image_max_tokens": 2048,
+  "extract_embedding": true,
+  "pooling_type": 3,
+  "extract_multimodal_embedding": true
+}
+```
+
+</details>
+
+<details>
+
+<summary>Embedding Ggemma 2 (mtmd-encoder)</summary>
+
+- https://huggingface.co/unsloth/embeddinggemma-2-GGUF
+
+```json
+{
+  "model_path": "I:\\LLM\\embedding\\embeddinggemma2\\embeddinggemma-2-BF16.gguf",
+  "mmproj_path": "I:\\LLM\\embedding\\embeddinggemma2\\mmproj-BF16.gguf",
+  "n_batch": 8192,
+  "n_ubatch": 8192,
+  "max_tokens": 4096,
+  "raw_mode": true,
+  "prompt_template": "{user}{images}",
+  "force_mmproj": false,
+  "image_min_tokens": 1024,
+  "image_max_tokens": 2048,
+  "extract_embedding": true,
+  "pooling_type": 1,
+  "extract_multimodal_embedding": true
 }
 ```
 

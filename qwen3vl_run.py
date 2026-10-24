@@ -6,19 +6,19 @@ import os
 import base64
 import time
 import gc
+import importlib
 import numpy as np
 import tempfile
 import traceback
 import re
 from PIL import Image
-from typing import List, Optional, Any
 
 from pathlib import Path
 current_dir = str(Path(__file__).parent)
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from debug_print import _debug_print, _debug_info
+from debug_print import _debug_print
 
 # Глобальный кеш для модели (чтобы сохранять между прямыми вызовами)
 _model_caches = {
@@ -70,6 +70,17 @@ def _norm_default(value, default):
     except Exception:
         pass
     return value
+
+def _debug_calc_speed(result, exec_time):
+    if exec_time == 0: 
+        return 0, 0
+    usage = result['usage']
+    #prompt_tokens = usage['prompt_tokens']
+    completion_tokens = usage['completion_tokens']
+    #total_tokens = usage['total_tokens']
+    speed = completion_tokens / exec_time
+
+    return completion_tokens, speed
 
 def _parse_strings_list(value):
     """
@@ -167,7 +178,254 @@ def build_prompt(template: str, system: str, user: str):
         # Если метки нет, весь текст идёт до картинок
         return result, ""
 
-def _build_image_content(image_item, quality=95):
+# Штатные template-переменные, которые уже приходят отдельными виджетами.
+# Соответствие "имя виджета" -> "имя переменной Jinja-шаблона".
+# Если имя отсутствует в таблице - оно передаётся как есть.
+_TEMPLATE_ARG_ALIASES = {
+    # --- Identity 
+    "enable_thinking":              "enable_thinking",
+    "force_reasoning":              "force_reasoning",
+    "add_vision_id":                "add_vision_id",
+
+    # --- Переименования 
+    "granite_controls":             "controls",
+}
+
+# Значения по умолчанию для штатных template-переменных.
+_TEMPLATE_ARG_DEFAULTS = {
+    "enable_thinking":  False,
+    "force_reasoning":  False,
+    "add_vision_id":    None,
+    "granite_controls": None,    
+}
+
+def _rename_template_args(args):
+    """
+    Переименовывает ключи template-аргументов в имена Jinja-переменных.
+
+    Известные ключи переименовываются согласно _TEMPLATE_ARG_ALIASES.
+    """
+    return {_TEMPLATE_ARG_ALIASES.get(key, key): value for key, value in args.items()}
+
+def _generic_template_arguments(config):
+    """
+    Аргументы Jinja-шаблона для generic-хендлера.
+    """
+    args = {}
+
+    # 1. Штатные виджеты.
+    for key in _TEMPLATE_ARG_ALIASES:
+        value = config.get(key)
+        if value is None:
+            value = _TEMPLATE_ARG_DEFAULTS.get(key)
+        if value is not None:
+            args[key] = value
+
+    # 2. Плоский хук template_arguments_<name>. Перекрывает штатные.
+    prefix = "template_arguments_"
+    for key, value in config.items():
+        if key.startswith(prefix) and len(key) > len(prefix):
+            args[key[len(prefix):]] = value
+
+    return args
+
+# chat_handler из конфига узла -> (класс llama-cpp, требование к версии).
+# Используется и при загрузке mmproj, и для текстового режима, где нужен
+# только chat-шаблон класса.
+_HANDLER_CLASSES = {
+    "gemma4":            ("Gemma4ChatHandler", "Gemma4 requires version v0.3.35 or higher."),
+    "qwen35":            ("Qwen35ChatHandler", "Qwen3.5 requires version v0.3.30 or higher."),
+    "qwen3":             ("Qwen3VLChatHandler", "Qwen3 requires version v0.3.17 or higher."),
+    "qwen3asr":          ("Qwen3ASRChatHandler", None),
+    "qwen25":            ("Qwen25VLChatHandler", None),
+    "generic":           ("GenericMTMDChatHandler", None),
+    "gemma3":            ("Gemma3ChatHandler", None),
+    "llava15":           ("Llava15ChatHandler", None),
+    "llava16":           ("Llava16ChatHandler", None),
+    "moondream":         ("MoondreamChatHandler", None),
+    "minicpmv26":        ("MiniCPMv26ChatHandler", None),
+    "minicpmv45":        ("MiniCPMv45ChatHandler", None),
+    "minicpmv46":        ("MiniCPMV46ChatHandler", None),
+    "glm41v":            ("GLM41VChatHandler", None),
+    "glm46v":            ("GLM46VChatHandler", None),
+    "granite":           ("GraniteDoclingChatHandler", None),
+    "lfm2vl":            ("LFM2VLChatHandler", None),
+    "lfm25vl":           ("LFM25VLChatHandler", None),
+    "paddleocr":         ("PaddleOCRChatHandler", None),
+    "obsidian":          ("ObsidianChatHandler", None),
+    "nanollava":         ("NanoLlavaChatHandler", None),
+    "llama3visionalpha": ("Llama3VisionAlphaChatHandler", None),
+    "step3vl":           ("Step3VLChatHandler", None),
+}
+
+def _resolve_handler_class(chat_handler_type):
+    """
+    Возвращает (класс обработчика, текст ошибки).
+    Класс = None, если тип неизвестен или класса нет в установленной llama-cpp-python.
+    """
+    entry = _HANDLER_CLASSES.get(chat_handler_type)
+    if entry is None:
+        return None, f"Unknown chat handler type: {chat_handler_type}"
+
+    class_name, requires = entry
+    module = importlib.import_module("llama_cpp.llama_chat_format")
+    handler_class = getattr(module, class_name, None)
+    if handler_class is None:
+        message = "You have an outdated version of the llama-cpp-python library."
+        if requires:
+            message = f"{message} {requires}"
+        return None, message
+
+    return handler_class, None
+
+def _handler_options(chat_handler_type, config):
+    """
+    Опции обработчика, зависящие от его типа.
+
+    llama-cpp складывает их в extra_template_arguments и передаёт в шаблон
+    (llama_multimodal.MTMDChatHandler._render_mtmd_prompt), поэтому в
+    текстовом режиме этот же набор идёт в шаблон напрямую.
+    """
+    if chat_handler_type == "gemma4":
+        return {"enable_thinking": config.get("enable_thinking", False)}
+
+    if chat_handler_type == "qwen35":
+        return {
+            "enable_thinking": config.get("enable_thinking", False),
+            "add_vision_id": config.get("add_vision_id"),
+        }
+
+    if chat_handler_type == "qwen3":
+        return {
+            "force_reasoning": config.get("force_reasoning", False),
+            "add_vision_id": config.get("add_vision_id"),
+        }
+
+    if chat_handler_type in ("minicpmv45", "minicpmv46", "glm46v", "step3vl"):
+        return {"enable_thinking": config.get("enable_thinking", False)}
+
+    if chat_handler_type == "granite":
+        return {"granite_controls": config.get("granite_controls", None)}
+
+    if chat_handler_type == "generic":
+        return _generic_template_arguments(config)
+
+    return {}
+
+def _build_text_prompt(llm, chat_handler_type, messages, config, debug):
+    """
+    Готовит промпт текстового режима по chat-шаблону выбранного обработчика.
+
+    Без mmproj обработчик не создаётся, и llama-cpp берёт шаблон из GGUF, а
+    если его там нет - угадывает формат и может свалиться на llama-2. Кроме
+    того, переменные шаблона (enable_thinking и т.п.) через
+    create_chat_completion не проходят: chat_formatter_to_chat_completion_handler
+    вызывает форматтер без **kwargs. Поэтому рендерим сами тем же шаблоном,
+    что использовался бы с mmproj.
+
+    Возвращает (токены промпта, stop-строки шаблона) либо (None, None),
+    если промпт нужно оставить на откуп create_chat_completion.
+    """
+    if not chat_handler_type:
+        return None, None
+
+    # Формат выбран пользователем явно - не подменяем.
+    if _norm_str(config.get("chat_format")): #legacy chat_format - обязательно оборачиваем в _norm_str, так как может прийти "none"
+        return None, None
+
+    t_build_text_prompt = time.perf_counter()
+
+    handler_class, handler_error = _resolve_handler_class(chat_handler_type)
+
+    template = None
+    template_arguments = {}
+
+    if chat_handler_type == "generic":
+        template = config.get("external_chat_format") # Не путать названия, это внешняя jinga 
+
+        if not isinstance(template, str) or not template:
+            try:
+                template = llm.metadata.get("tokenizer.chat_template") # Шаблон из gguf
+            except Exception:
+                template = None
+
+        template_arguments.update(
+            _rename_template_args(_handler_options(chat_handler_type, config))
+        )
+
+    else:
+
+        template = getattr(handler_class, "CHAT_FORMAT", None) if handler_class else None
+
+        # Шаблоны GLM ссылаются на константы своего класса, например GLM46V_EOS_TOKEN.
+        template_arguments = {
+            name: value
+            for name, value in vars(handler_class).items()
+            if name.isupper() and name != "CHAT_FORMAT"
+        }
+
+        template_arguments.update(
+            _rename_template_args(_handler_options(chat_handler_type, config))
+        )
+
+    if not isinstance(template, str):
+        print(f"[WARNING] No chat template for chat_handler '{chat_handler_type}'"
+              f"{': ' + handler_error if handler_error else ''}; using the model's own format.",
+              file=sys.stderr)
+        return None, None
+
+    from llama_cpp.llama_chat_format import Jinja2ChatFormatter
+
+    def token_text(token_id):
+        if token_id == -1:
+            return ""
+        return llm.detokenize([token_id], special=True).decode("utf-8", errors="replace")
+
+    eot_token_id = llm.token_eot()
+    formatter = Jinja2ChatFormatter(
+        template=template,
+        eos_token=token_text(llm.token_eos()),
+        bos_token=token_text(llm.token_bos()),
+        stop_token_ids=[t for t in (llm.token_eos(), eot_token_id) if t != -1],
+        special_tokens_map={
+            name: text
+            for name, token_id in (
+                ("eot_token", eot_token_id),
+                ("sep_token", llm.token_sep()),
+                ("nl_token", llm.token_nl()),
+                ("pad_token", llm.token_pad()),
+                ("mask_token", llm.token_mask()),
+            )
+            if token_id != -1 and (text := token_text(token_id))
+        },
+    )
+
+    result = formatter(messages=messages, **template_arguments)
+
+    # Отладка: видеть, что уходит в промпт.
+    if config.get("verbose", False):
+        prompt = result.prompt if isinstance(result.prompt, str) else ""
+        print(f"Handler={chat_handler_type}\n"
+              f"Template_source={'gguf' if chat_handler_type == 'generic' else 'class'}\n"
+              f"Args={template_arguments}", file=sys.stderr)
+        print(f"Rendered prompt:\n{prompt}", file=sys.stderr)
+
+    # Служебные токены уже расставлены шаблоном, поэтому BOS не добавляем -
+    # так же поступает chat_formatter_to_chat_completion_handler.
+    tokens = llm.tokenize(result.prompt.encode("utf-8"), add_bos=not result.added_special, special=True)
+
+    _debug_print(debug, f"build_text_prompt", t_build_text_prompt, text=f"rendered with {chat_handler_type} chat template", file=sys.stderr)
+
+    return tokens, result.stop
+
+# ============================================================
+# Image helpers (phase 2)
+# ============================================================
+
+def _build_image_content(image_item, config):
+
+    image_content_key = config.get("image_content_key") or "image_url"
+    quality = config.get("image_quality", 95)
 
     # Сценарий 1: image -> в base64
     if isinstance(image_item, Image.Image):
@@ -175,13 +433,19 @@ def _build_image_content(image_item, quality=95):
         image_item.save(buffer, format="JPEG", quality=quality, optimize=True)
         base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
         file_url = f"data:image/jpeg;base64,{base64_str}"
-        return {"type": "image_url", "image_url": {"url": file_url}}
+        return {
+            "type": image_content_key, 
+            image_content_key: {"url": file_url}
+        }
     
     # Сценарий 2: путь к файлу -> передача пути напрямую
     elif isinstance(image_item, str):
         if Path(image_item).exists():
             file_url = Path(image_item).resolve().as_uri()
-            return {"type": "image_url", "image_url": {"url": file_url}}
+            return {
+                "type": image_content_key, 
+                image_content_key: {"url": file_url}
+            }
         else:
             print(f"build_image: Image file not found: {image_item}", file=sys.stderr)
             return None
@@ -190,14 +454,20 @@ def _build_image_content(image_item, quality=95):
         print(f"build_image: Unsupported type: {type(image_item)}", file=sys.stderr)
         return None
 
-def _build_audio_content(audio_item):
+# ============================================================
+# Audio helpers (phase 2)
+# ============================================================
+
+def _build_audio_content(audio_item, config):
+
+    audio_content_key = config.get("audio_content_key") or "input_audio"
 
     # Сценарий 1: байты WAV -> в base64
     if isinstance(audio_item, bytes):
         b64_data = base64.b64encode(audio_item).decode("utf-8")
         return {
-            "type": "input_audio",
-            "input_audio": {"data": b64_data, "format": "wav"}
+            "type": audio_content_key,
+            audio_content_key: {"data": b64_data, "format": "wav"}
         }
 
     # Сценарий 2: путь к файлу -> в base64
@@ -208,8 +478,8 @@ def _build_audio_content(audio_item):
                 wav_bytes = f.read()
             b64_data = base64.b64encode(wav_bytes).decode("utf-8")
             return {
-                "type": "input_audio",
-                "input_audio": {"data": b64_data, "format": "wav"}
+                "type": audio_content_key,
+                audio_content_key: {"data": b64_data, "format": "wav"}
             }
         else:
             print(f"build_audio: Audio file not found: {audio_item}", file=sys.stderr)
@@ -219,62 +489,80 @@ def _build_audio_content(audio_item):
         print(f"build_audio: Unsupported type: {type(audio_item)}", file=sys.stderr)
         return None
 
-def _build_video_content(video_input, config):
+# ============================================================
+# Video helpers (phase 2)
+# ============================================================
 
+def _build_video_native(video_item, config, video_num):
+    """Нативный режим MTMD: передаем путь к файлу напрямую."""
+
+    video_content_key = config.get("video_content_key") or "video"
+
+    file_path = video_item.get("path")
+    if file_path is None:
+        print(f"[ERROR] Native video path not found", file=sys.stderr)
+        return []
+
+    if not os.path.exists(file_path):
+        print(f"[ERROR] Native video file not found: {file_path}", file=sys.stderr)
+        return []
+
+    abs_path = os.path.abspath(file_path)
+    return [{
+        "type": video_content_key,
+        video_content_key: abs_path
+    }]
+
+def _build_video_as_images(video_item, config, video_num):
+    """Режим изображений: извлекаем кадры и кодируем в base64."""
     max_frames = config.get('max_frames', 24)
     quality = config.get('frame_quality', 75)
-    trim_start = config.get('trim_start', 0.0)
-    trim_duration = config.get('trim_duration', 0.0)
-    frame_id = _norm_default(config.get("add_frame_id", ""), "")
-    
-    # ==========================================
-    # РЕЖИМ 1: Нативное видео в llama.cpp
-    # ==========================================
+    frame_id = config.get("add_frame_id", "").strip()
+    image_content_key = config.get("image_content_key") or "image_url"
 
-    # Unsupported
-
-    # ==========================================
-    # РЕЖИМ 2: Прореженные кадры как изображения
-    # ==========================================
-    
-    video_content_items = []
     frames_to_process = []
-    
-    # Сценарий 1: Путь к файлу (Работа через cv2) ---
-    if isinstance(video_input, str):
 
+    file_path = video_item.get("path")
+    np_frames = video_item.get("array")
+
+    if file_path is not None:
+
+        trim_start = video_item.get("trim_start", 0.0)
+        trim_duration = video_item.get("trim_duration", 0.0)
+
+        # Сценарий 1: Путь к файлу (Работа через cv2)
         import cv2
 
-        video_path = video_input
-        if not os.path.exists(video_path):
-            print(f"[ERROR] Video file not found: {video_path}", file=sys.stderr)
+        if not os.path.exists(file_path):
+            print(f"[ERROR] Video file not found: {file_path}", file=sys.stderr)
             return []
             
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(file_path)
         if not cap.isOpened():
+            print(f"[ERROR] Failed to open video file: {file_path}", file=sys.stderr)
             return []
             
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0: fps = 30.0
+        if fps <= 0: 
+            fps = 30.0 # Fallback
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames <= 0:
             cap.release()
             return []
             
-        # Применяем обрезку (trim) из config
         start_frame = int(trim_start * fps)
         if trim_duration > 0:
             end_frame = int((trim_start + trim_duration) * fps)
         else:
             end_frame = total_frames
             
+        # Защита от выхода за границы
         start_frame = max(0, min(start_frame, total_frames - 1))
         end_frame = max(start_frame + 1, min(end_frame, total_frames))
         
         effective_total = end_frame - start_frame
         
-        # Прореживание кадров в пределах обрезанного окна
         if effective_total > max_frames:
             indices = set(np.linspace(0, effective_total - 1, max_frames, dtype=int).tolist())
         else:
@@ -286,74 +574,81 @@ def _build_video_content(video_input, config):
         
         while cap.isOpened() and current_idx < end_frame:
             ret, frame = cap.read()
-            if not ret: break
+            if not ret: 
+                break
             
             if (current_idx - start_frame) in indices:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames_to_process.append(frame_rgb)
                 selected_count += 1
-                if selected_count >= max_frames: break
+                if selected_count >= max_frames: 
+                    break
             current_idx += 1
         cap.release()
-        
-    # Сценарий 2: Numpy массив (in-memory)
-    elif isinstance(video_input, np.ndarray):
-        np_frames = video_input
-        # Ожидаем формат (T, H, W, C)
+
+    elif np_frames is not None:
+
+        # Сценарий 2: Numpy массив (in-memory)
         if len(np_frames.shape) != 4:
             print(f"[ERROR] Invalid numpy array shape for video: {np_frames.shape}", file=sys.stderr)
             return []
             
         total_frames = np_frames.shape[0]
-        
-        # Прореживание
         if total_frames > max_frames:
             indices = np.linspace(0, total_frames - 1, max_frames, dtype=int)
             frames_to_process = [np_frames[i] for i in indices]
         else:
             frames_to_process = [np_frames[i] for i in range(total_frames)]
-            
+
     else:
-        print(f"[ERROR] Unsupported video_input type in _build_video_content: {type(video_input)}", file=sys.stderr)
+        print(f"[ERROR] Unsupported video_item type: missing 'path' and 'array'", file=sys.stderr)
         return []
+
+    if not frames_to_process:
+        print(f"[ERROR] No frames extracted from video_item", file=sys.stderr)
+        return []
+
+    video_content_items = []
         
-    num = 0
-    # Кодируем кадры в base64 
+    frame_num = 0
     for frame_rgb in frames_to_process:
         img = Image.fromarray(frame_rgb)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality) 
-        img_bytes = buf.getvalue()
-        b64_data = base64.b64encode(img_bytes).decode("utf-8")
+        b64_data = base64.b64encode(buf.getvalue()).decode("utf-8")
         
         if frame_id:
-            video_content_items.append({"type": "text", "text": frame_id.replace("{num}", str(num))})
+            text = frame_id.replace("{frame_num}", str(frame_num)).replace("{video_num}", str(video_num))
+            video_content_items.append({"type": "text", "text": text})
 
         video_content_items.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}
+            "type": image_content_key,
+            image_content_key: {"url": f"data:image/jpeg;base64,{b64_data}"}
         })
-        num += 1
+        frame_num += 1
         
     return video_content_items
 
-def _debug_calc_speed(result, exec_time):
-    if exec_time == 0: 
-        return 0, 0
-    usage = result['usage']
-    #prompt_tokens = usage['prompt_tokens']
-    completion_tokens = usage['completion_tokens']
-    #total_tokens = usage['total_tokens']
-    speed = completion_tokens / exec_time
+def _build_video_content(video_item, config, video_num):
+    """Маршрутизатор видео-контента (Фаза 2)"""
+    if not isinstance(video_item, dict):
+        print("[ERROR] Unsupported video_item type (expected dict)", file=sys.stderr)
+        return []
 
-    return completion_tokens, speed
+    video_mode = config.get("video_mode", "images")
+    if video_mode == "native":
+        return _build_video_native(video_item, config, video_num)
+    else:
+        return _build_video_as_images(video_item, config, video_num)
 
 # =====================================================================
 # INTERRUPTIBLE STREAMING
 # =====================================================================
-def _stream_chat_completion(llm, messages, completion_kwargs, debug=False):
+def _consume_stream(llm, stream, get_chunk_text, completion_kwargs):
     """
-    Streaming-обертка с проверкой прерывания раз в N токенов.
+    Общий цикл чтения стрима: проверка прерывания раз в N токенов и прогресс-бар.
+    get_chunk_text достаёт текст из chunk (формат отличается у chat и raw completion).
+    Возвращает (output, prompt_tokens, completion_tokens).
     """
     collected_content = []
     prompt_tokens = 0
@@ -371,12 +666,6 @@ def _stream_chat_completion(llm, messages, completion_kwargs, debug=False):
         has_comfy = True
     except ImportError:
         has_comfy = False
-
-    stream = llm.create_chat_completion(
-        messages=messages,
-        stream=True,
-        **completion_kwargs
-    )
 
     for chunk in stream:
         tick += 1
@@ -397,8 +686,7 @@ def _stream_chat_completion(llm, messages, completion_kwargs, debug=False):
         if "usage" in chunk and chunk["usage"]:
             prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
 
-        delta = chunk["choices"][0].get("delta", {})
-        content = delta.get("content")
+        content = get_chunk_text(chunk)
         if content:
             collected_content.append(content)
             completion_tokens += 1
@@ -430,50 +718,1109 @@ def _stream_chat_completion(llm, messages, completion_kwargs, debug=False):
         sys.stderr.write(bar_line)
         sys.stderr.flush()
 
-    output = "".join(collected_content)
+    return "".join(collected_content), prompt_tokens, completion_tokens
+
+def _stream_usage(prompt_tokens, completion_tokens):
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+def _stream_chat_completion(llm, messages, completion_kwargs):
+    """
+    Streaming-обертка для chat completion с проверкой прерывания.
+    """
+    stream = llm.create_chat_completion(
+        messages=messages,
+        stream=True,
+        **completion_kwargs
+    )
+    output, prompt_tokens, completion_tokens = _consume_stream(
+        llm, stream, lambda chunk: chunk["choices"][0].get("delta", {}).get("content"), completion_kwargs
+    )
 
     return {
         "choices": [{"message": {"content": output}}],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
+        "usage": _stream_usage(prompt_tokens, completion_tokens),
     }
+
+def _stream_completion(llm, prompt, completion_kwargs):
+    """
+    Streaming-обертка для raw completion с проверкой прерывания.
+    """
+    stream = llm.create_completion(
+        prompt=prompt,
+        stream=True,
+        **completion_kwargs
+    )
+    output, prompt_tokens, completion_tokens = _consume_stream(
+        llm, stream, lambda chunk: chunk["choices"][0].get("text"), completion_kwargs
+    )
+
+    return {
+        "choices": [{"text": output}],
+        "usage": _stream_usage(prompt_tokens, completion_tokens),
+    }
+
+# =====================================================================
+# TTS
+# =====================================================================
+
+def _load_tts_llm(config):
+    """
+    Загружает Llama для TTS-режима (extract_tts = True)
+    """
+    t_load = time.perf_counter()
+
+    verbose = config.get("verbose", False)
+    debug   = config.get("debug", False)
+    model_path  = (config.get("model_path") or "").strip()
+    mmproj_path = (config.get("mmproj_path") or "").strip()
+    if not model_path:
+        raise ValueError("model_path is required for TTS")
+    if not mmproj_path:
+        raise ValueError("mmproj_path is required for TTS")
+
+    from llama_cpp import Llama
+    from llama_cpp.llama_embedding import LLAMA_POOLING_TYPE_NONE
+
+    llm_kwargs = {
+        "model_path":   model_path,
+        "n_ctx":        config.get("n_ctx", config.get("ctx", 8192)),
+        "n_batch":      config.get("n_batch", 2048),
+        "n_ubatch":     config.get("n_ubatch", 512),
+        # параметры для TTS (v0.4.0)
+        "embeddings":   True,
+        "pooling_type": config.get("pooling_type", LLAMA_POOLING_TYPE_NONE),
+        "use_mmap":     config.get("use_mmap", False),
+        "verbose":      verbose,
+        "n_gpu_layers": config.get("n_gpu_layers", config.get("gpu_layers", -1)),
+    }
+
+    # Пробрасываем кастомные параметры extra_llama_*
+    for key, value in config.items():
+        if key.startswith("extra_llama_"):
+            new_key = key[len("extra_llama_"):]
+            llm_kwargs[new_key] = value
+
+    llm = Llama(**llm_kwargs)
+
+    _debug_print(debug, "load_model (tts)", t_load, file=sys.stderr)
+    return llm
+
+def _infer_tts(llm, config, images = [], audios = [], videos = []):
+    """
+    TTS-инференс: MTMDAudioGenerator.create_speech (extract_tts = True)
+    """
+    try:
+        t_tts = time.perf_counter()
+
+        debug = config.get("debug", False)
+        mmproj_path = (config.get("mmproj_path") or "").strip()
+        user_prompt = (config.get("user_prompt") or "").strip()
+
+        from llama_cpp.llama_multimodal import MTMDAudioGenerator
+
+        # 1. Инициализируем генератор аудио
+        audio_gen = MTMDAudioGenerator(
+            mmproj_path=mmproj_path,
+            batch_max_tokens=config.get("mmproj_batch_max_tokens", 1024),
+            use_gpu=config.get("mmproj_use_gpu", True),
+            flash_attn=config.get("mmproj_flash_attn", True),
+        )
+
+        # 2. Собираем аргументы для create_speech
+        tts_kwargs = {
+            "llama": llm,
+            "text": user_prompt,
+            "seed": config.get("seed", 42),
+            "max_frames": config.get("max_tokens", 2048),
+            "temperature": config.get("temperature", 0.7),
+            "repeat_penalty": config.get("repeat_penalty", 1.1),
+            "top_p": config.get("top_p", 0.92),
+            "min_p": config.get("min_p", 0.05),
+            "top_k": config.get("top_k", 0),
+        }
+
+        # Опциональные параметры из конфига
+        language = config.get("language", "").strip()
+        if language:
+            tts_kwargs["language"] = language
+
+        # Первый аудио файл - референс
+        if audios:
+            for aud_item in audios:
+                if aud_item is not None:
+                    tts_kwargs["speaker_reference"] = aud_item
+                    break
+
+        # Пробрасываем кастомные параметры tts_kwargs_*
+        for key, value in config.items():
+            if key.startswith("tts_kwargs_"):
+                new_key = key[len("tts_kwargs_"):]
+                tts_kwargs[new_key] = value
+
+        # 3. Запускаем генерацию
+        generated_audio = audio_gen.create_speech(**tts_kwargs)
+
+        # 4. Проверка результата
+        if generated_audio.finish_reason == "length":
+            print("[WARNING] Audio has been cut off (max_frames limit reached)", file=sys.stderr)
+
+        _debug_print(debug, "get tts", t_tts, file=sys.stderr)
+
+        # 5. Извлекаем байты (атрибут .data)
+        return {
+            "status": "success", 
+            "output": "", 
+            "data_type": 2
+        }, generated_audio.data
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"TTS inference failed: {e}",
+            "traceback": traceback.format_exc(),
+        }, None
+
+# =====================================================================
+# TEXT EMBEDDING
+# =====================================================================
+
+def _load_text_embedder(config):
+    """
+    Загружает LlamaEmbedding для текстовых эмбеддингов (extract_embedding = True)
+    """
+    t_load = time.perf_counter()
+
+    verbose = config.get("verbose", False)
+    debug   = config.get("debug", False)
+    model_path  = (config.get("model_path") or "").strip()
+
+    if not model_path:
+        raise ValueError("model_path is required for embedding")
+
+    from llama_cpp.llama_embedding import LlamaEmbedding, LLAMA_POOLING_TYPE_NONE
+
+    llm_kwargs = {
+        "model_path":   model_path,
+        "n_ctx":        config.get("n_ctx", config.get("ctx", 8192)),
+        "n_batch":      config.get("n_batch", 2048),
+        "n_ubatch":     config.get("n_ubatch", 512),
+        "n_keep":       config.get("n_keep", 256),
+        "verbose":      verbose,
+        "n_gpu_layers": config.get("n_gpu_layers", config.get("gpu_layers", -1)),
+        "pooling_type": config.get("pooling_type", LLAMA_POOLING_TYPE_NONE),
+        "n_seq_max":    config.get("n_seq_max", 1), #TODO сделать батчевый режим
+        "kv_unified": True,
+    }
+
+    # Пробрасываем кастомные параметры extra_llama_*
+    for key, value in config.items():
+        if key.startswith("extra_llama_"):
+            new_key = key[len("extra_llama_"):]
+            llm_kwargs[new_key] = value
+
+    llm = LlamaEmbedding(**llm_kwargs)
+
+    _debug_print(debug, "load_model (text-embed)", t_load, file=sys.stderr)
+    return llm
+
+def _infer_text_embedding(llm, config, images = [], audios = [], videos = []):
+    """
+    Текстовый эмбеддинг: LlamaEmbedding.create_embedding (extract_embedding = True)
+    """
+    try:
+        t_emb = time.perf_counter()
+        debug = config.get("debug", False)
+
+        system_prompt = (config.get("system_prompt") or "").strip()
+        user_prompt = (config.get("user_prompt") or "").strip()
+
+        # 1. Опциональная подмена токенизатора внешним (HuggingFace).
+        #    Соответствие «токены в llama.cpp» и «токены HF-токенизатора» —
+        #    ответственность пользователя: code подменяет llm.tokenize как есть.
+        tokenizer_path = config.get("tokenizer_path", "")
+        if tokenizer_path:
+            t_tok = time.perf_counter()
+            original_tokenize = llm.tokenize
+            try:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+
+                def custom_tokenize(text, add_bos=False, special=False):
+                    prompt_str = text.decode("utf-8")
+                    return tokenizer.encode(prompt_str, add_special_tokens=False)
+
+                llm.tokenize = custom_tokenize
+            except Exception as e:
+                print(f"[WARNING] External tokenizer failed: {e}", file=sys.stderr)
+                llm.tokenize = original_tokenize
+
+            _debug_print(debug, "connect external tokenizer", t_tok, file=sys.stderr)
+
+        # 2. Формируем промпт по шаблону (если задан) или как есть.
+        template_str = config.get("prompt_template", "")
+        if template_str:
+            text_before, text_after = build_prompt(template_str, system=system_prompt, user=user_prompt)
+            prompt = text_before + text_after
+        else:
+            prompt = user_prompt
+
+        # 3. Инференс.
+        response = llm.create_embedding(prompt, normalize=-1)
+        emb = response['data'][0]['embedding']
+
+        if isinstance(emb, list):
+            emb_np = np.array(emb, dtype=np.float32)
+        else:
+            emb_np = np.array([emb], dtype=np.float32)
+
+        scale = _norm_default(config.get("embedding_scale"), 1.0)
+        if scale is not None:
+            emb_np = (emb_np * scale).astype(np.float32)
+
+        _debug_print(debug, "get embedding", t_emb, file=sys.stderr)
+        return {
+            "status": "success", 
+            "output": "", 
+            "data_type": 1
+        }, emb_np
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Text embedding extraction failed: {e}",
+            "traceback": traceback.format_exc(),
+        }, None
+
+# =====================================================================
+# MULTIMODAL EMBEDDER
+# =====================================================================
+
+_SUPPORTED_BY_STB = frozenset({"PNG", "JPEG", "JPG", "BMP",
+                               "GIF", "TGA", "PSD", "PIC", "PNM", "HDR"})
+
+def _read_image_as_supported_bytes(path: str) -> bytes:
+    """
+    stb_image внутри llama.cpp не знает WebP (и ещё десятка форматов).
+    Декодируем через PIL и, если формат не из списка stb — отдаём PNG
+    байты прямо из памяти, без временного файла.
+    """
+    try:
+        with Image.open(path) as pil:
+            fmt = (pil.format or "").upper()
+            if fmt in _SUPPORTED_BY_STB:
+                with open(path, "rb") as f:
+                    return f.read()
+
+            pil.load()
+            if pil.mode not in ("RGB", "RGBA", "L"):
+                pil = pil.convert("RGB")
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG", optimize=False)
+            return buf.getvalue()
+
+    except Exception as e:
+        print(f"[RAG] _read_image_as_supported_bytes({path!r}) failed: {e}",
+              file=sys.stderr)
+        # Последний шанс: отдать как есть — вдруг stb всё-таки осилит.
+        with open(path, "rb") as f:
+            return f.read()
+
+VL_EMBEDDING_PROMPT_TEMPLATE = "{user}{images}"
+VL_EMBEDDING_DEFAULT_SYSTEM = ""
+VL_EMBEDDING_POOLING_TYPE = 3  # LAST
+VL_EMBEDDING_DEFAULT_NORMALIZE = 0
+
+def _load_multimodal_embedder(config):
+    """
+    Загружает Llama для мультимодального эмбеддера (extract_multimodal_embedding = True)
+    """
+    t_load = time.perf_counter()
+
+    verbose  = config.get("verbose", False)
+    debug  = config.get("debug", False)
+    model_path  = (config.get("model_path") or "").strip()
+    mmproj_path = (config.get("mmproj_path") or "").strip()
+
+    if not model_path:
+        raise ValueError("model_path is required for image embedding")
+    if not mmproj_path:
+        raise ValueError("mmproj_path is required for image embedding")
+
+    from llama_cpp import Llama
+    from llama_cpp.llama_multimodal import MTMDEmbeddingHandler
+
+    llm_kwargs = {
+        "model_path":    model_path,
+        "n_ctx":         config.get("n_ctx", 8192),
+        "n_batch":       config.get("n_batch", 2048),
+        "n_ubatch":      config.get("n_ubatch", 512),
+        "n_keep":        config.get("n_keep", 256),
+        "verbose":       verbose,
+        "n_gpu_layers":  config.get("n_gpu_layers", -1),
+        "embeddings":    True,
+        "pooling_type":  config.get("pooling_type", VL_EMBEDDING_POOLING_TYPE),
+        "logits_all":    False,
+        "n_seq_max":     config.get("n_seq_max", 1), #TODO сделать батчевый режим
+        "kv_unified":    True,
+    }
+
+    # Пробрасываем кастомные параметры extra_llama_*
+    for key, value in config.items():
+        if key.startswith("extra_llama_"):
+            new_key = key[len("extra_llama_"):]
+            llm_kwargs[new_key] = value
+
+    llm = Llama(**llm_kwargs)
+
+    mtmd_kwargs = {
+        "mmproj_path":  mmproj_path,
+        "verbose":      verbose,
+    }
+
+    image_min_tokens = config.get("image_min_tokens", 0)
+    image_max_tokens = config.get("image_max_tokens", 0)
+
+    if image_min_tokens:
+        mtmd_kwargs["image_min_tokens"] = int(image_min_tokens)
+    if image_max_tokens:
+        mtmd_kwargs["image_max_tokens"] = int(image_max_tokens)
+
+    # Пробрасываем кастомные параметры extra_mtmd_*
+    for key, value in config.items():
+        if key.startswith("extra_mtmd_"):
+            new_key = key[len("extra_mtmd_"):]
+            mtmd_kwargs[new_key] = value
+
+    embedder = MTMDEmbeddingHandler(**mtmd_kwargs)
+
+    llm._mtmd_embedder = embedder
+
+    _debug_print(debug, "load_model (mm-embed)", t_load, file=sys.stderr)
+    return llm
+
+def _infer_multimodal_embedding(llm, config, images = [], audios = [], videos = []):
+    """
+    Multimodal image embedding (extract_multimodal_embedding = True)
+    """
+    try:
+        t_inference = time.perf_counter()
+
+        debug = config.get("debug", False)
+        embedder = getattr(llm, "_mtmd_embedder", None)
+        if embedder is None:
+            raise RuntimeError("MTMDEmbeddingHandler is not attached to Llama")
+
+        prompt_template = (config.get("prompt_template") or "")
+        if not prompt_template:
+            prompt_template = VL_EMBEDDING_PROMPT_TEMPLATE
+
+        system_prompt = (config.get("system_prompt") or "").strip()
+        if not system_prompt:
+            system_prompt = VL_EMBEDDING_DEFAULT_SYSTEM
+
+        user_prompt = (config.get("user_prompt") or "").strip()
+
+        def _read_part(p, is_image):
+            if isinstance(p, (bytes, bytearray)):
+                return bytes(p)
+            if is_image:
+                return _read_image_as_supported_bytes(p)
+            with open(p, "rb") as f:
+                return f.read()
+
+        media_bytes = ( [_read_part(p, True)  for p in images] + [_read_part(p, False) for p in audios] + [_read_part(p, False) for p in videos] )
+
+        text_before, text_after = build_prompt(prompt_template, system=system_prompt, user=user_prompt)
+
+        parts = [text_before]
+        parts.extend(media_bytes)
+        if text_after:
+            parts.append(text_after)
+
+        embedding, n_tokens = embedder.embed(
+            llm,
+            parts=parts,
+            normalize=config.get("normalize", VL_EMBEDDING_DEFAULT_NORMALIZE),
+            return_count=True,
+        )
+
+        arr = np.asarray(embedding, dtype=np.float32)
+
+        _debug_print(debug, "inference (mm-embed)", t_inference, file=sys.stderr)
+        return {
+            "status": "success", 
+            "output": "", 
+            "data_type": 1
+        }, arr
+
+    except Exception as e:
+        return {
+            "status": "error", 
+            "message": f"Multimodal embedding extraction failed: {e}",
+            "traceback": traceback.format_exc(),
+        }, None
+
+# =====================================================================
+# LLM (chat / raw / vision)
+# =====================================================================
+
+def _load_llm(config, is_vision_model):
+    """
+    Загружает Llama для chat/raw режима.
+    Если is_vision_model=True — создаёт chat_handler и привязывает его к Llama. 
+    """
+    debug   = config.get("debug", False)
+    verbose = config.get("verbose", False)
+
+    chat_handler_type    = _norm_str(config.get("chat_handler")) #обязательно оборачиваем в _norm_str, так как может прийти "none"
+    chat_format          = _norm_str(config.get("chat_format")) #legacy chat_format - обязательно оборачиваем в _norm_str, так как может прийти "none"
+    raw_mode             = config.get("raw_mode", False)
+    speculative_enabled  = config.get("speculative_enabled", False)
+
+    model_path  = (config.get("model_path") or "").strip()
+    use_native_llamacpp = config.get("_native_llamacpp", False)
+
+    if not model_path and not config.get("llama_server_url"):
+        raise ValueError("model_path is required for LLM")
+
+    t_first_import = time.perf_counter()
+
+    if use_native_llamacpp:
+        from utils import Llama
+    else:
+        from llama_cpp import Llama
+
+    _debug_print(debug, "import llama_cpp", t_first_import, file=sys.stderr)
+
+    chat_handler = None
+
+    # chat_handler (только для vision)
+    if is_vision_model and not use_native_llamacpp:
+        t_handler = time.perf_counter()
+
+        if not chat_handler_type:
+            raise ValueError("chat_handler is not set")
+
+        mmproj_path = (config.get("mmproj_path") or "").strip()
+
+        if not mmproj_path:
+            raise ValueError("mmproj_path is required for multimodal LLM")
+
+        handler_kwargs = {"verbose": verbose}
+
+        video_ffmpeg_bin_dir = config.get("video_ffmpeg_bin_dir", None)
+        if video_ffmpeg_bin_dir:
+            handler_kwargs["video_ffmpeg_bin_dir"] = video_ffmpeg_bin_dir
+            handler_kwargs["video_fps_target"] = config.get("video_fps_target", 1.0)
+            handler_kwargs["video_timestamp_interval_ms"] = config.get("video_timestamp_interval_ms", 5000)
+            handler_kwargs["batch_max_tokens"] = config.get("mmproj_batch_max_tokens", 1024)
+
+        image_min_tokens = config.get("image_min_tokens", 0)
+        image_max_tokens = config.get("image_max_tokens", 0)
+
+        if image_min_tokens:
+            handler_kwargs["image_min_tokens"] = int(image_min_tokens)
+        if image_max_tokens:
+            handler_kwargs["image_max_tokens"] = int(image_max_tokens)
+
+        # Пробрасываем кастомные параметры extra_chat_handler_*
+        for key, value in config.items():
+            if key.startswith("extra_chat_handler_"):
+                new_key = key[len("extra_chat_handler_"):]
+                handler_kwargs[new_key] = value
+
+        handler_class, handler_error = _resolve_handler_class(chat_handler_type)
+        if handler_class is None:
+            raise ValueError(handler_error)
+
+        extra_handler_kwargs = _rename_template_args(
+            _handler_options(chat_handler_type, config)
+        )
+
+        if chat_handler_type == "generic":
+            # Generic получает template-переменные вложенными в extra_template_arguments.
+            if extra_handler_kwargs:
+                handler_kwargs["extra_template_arguments"] = extra_handler_kwargs
+
+            chat_handler = handler_class(
+                mmproj_path=mmproj_path,
+                chat_format=config.get("external_chat_format") or None, #Не путать названия, это внешняя jinga, если None значит чат формат будет браться из gguf
+                **handler_kwargs,
+            )
+        else:
+            chat_handler = handler_class(
+                clip_model_path=mmproj_path,
+                **handler_kwargs,
+                **extra_handler_kwargs,
+            )
+
+        _debug_print(debug, "create_chat_handler", t_handler, file=sys.stderr)
+
+    t_llm = time.perf_counter()
+
+    # Параметры Llama
+    llm_kwargs = {
+        "model_path":            model_path,
+        "n_ctx":                 config.get("n_ctx", config.get("ctx", 8192)),
+        "n_batch":               config.get("n_batch", 2048),
+        "n_ubatch":              config.get("n_ubatch", 512),
+        "n_keep":                config.get("n_keep", 256),
+        "swa_full":              config.get("swa_full", False),
+        "verbose":               verbose,
+        "pool_size":             config.get("pool_size", 4194304),
+        "n_threads":             config.get("n_threads", config.get("cpu_threads", 8)),
+        "n_gpu_layers":          config.get("n_gpu_layers", config.get("gpu_layers", -1)),
+        "split_mode":            config.get("split_mode", 0),
+        "main_gpu":              config.get("main_gpu", 0),
+        "ctx_checkpoints":       config.get("ctx_checkpoints", 0),
+        "checkpoint_on_device":  config.get("checkpoint_on_device", False),
+        "logits_all":            config.get("logits_all", False),
+        "n_cpu_moe":             config.get("n_cpu_moe", 0),
+        "cpu_moe":               config.get("cpu_moe", False),
+        "use_mmap":              config.get("use_mmap", False),
+        "use_mlock":             config.get("use_mlock", False),
+        "offload_kqv":           config.get("offload_kqv", True),
+    }
+
+    # Опциональные параметры из конфига
+    tensor_split = _parse_float_list(config.get("tensor_split"))
+    if tensor_split:
+        llm_kwargs["tensor_split"] = tensor_split
+
+    if (type_k := _norm_default(config.get("type_k"), 1)) is not None:
+        llm_kwargs["type_k"] = type_k
+    if (type_v := _norm_default(config.get("type_v"), 1)) is not None:
+        llm_kwargs["type_v"] = type_v
+    if (flash_attn_type := _norm_default(config.get("flash_attn_type"), -1)) is not None:
+        llm_kwargs["flash_attn_type"] = flash_attn_type
+
+    # Пробрасываем кастомные параметры extra_llama_*
+    for key, value in config.items():
+        if key.startswith("extra_llama_"):
+            new_key = key[len("extra_llama_"):]
+            llm_kwargs[new_key] = value
+
+    if use_native_llamacpp:
+        llm_kwargs["_native_config"] = config
+
+    # Speculative
+    # 0=NONE, 1=DRAFT_SIMPLE, 2=DRAFT_EAGLE3, 3=DRAFT_MTP, 4=DRAFT_DFLASH,
+    # 5=DRAFT_DSPARK, 6=NGRAM_SIMPLE, 7=NGRAM_MAP_K, 8=NGRAM_MAP_K4V,
+    # 9=NGRAM_MOD, 10=NGRAM_CACHE
+    if speculative_enabled:
+        try:
+            from llama_cpp.llama_speculative import SpecConfig, SpeculativeType
+        except ImportError:
+            speculative_enabled = False
+
+        if speculative_enabled:
+            t_speculative = time.perf_counter()
+
+            speculative_type = int(config.get("speculative_type", 3))
+            try:
+                valid_speculative_type = SpeculativeType(speculative_type)
+            except ValueError:
+                speculative_enabled = False
+
+            if speculative_enabled:
+                spec_kwargs = {
+                    "spec_type":   valid_speculative_type,
+                    "draft_n_max": config.get("draft_n_max", 2),
+                    "draft_p_min": config.get("draft_p_min", 0.0),
+                }
+
+                # Параметры для внешних черновых моделей
+                draft_model_path = (config.get("draft_model_path") or "").strip()
+                if draft_model_path:
+                    spec_kwargs["draft_model_path"] = draft_model_path
+                    spec_kwargs["draft_n_gpu_layers"] = config.get("draft_n_gpu_layers", -1)
+                    spec_kwargs["draft_backend_sampling"] = config.get("draft_backend_sampling", True)
+
+                # Параметры для N-gram семейства
+                if valid_speculative_type in (
+                    SpeculativeType.NGRAM_SIMPLE,
+                    SpeculativeType.NGRAM_MAP_K,
+                    SpeculativeType.NGRAM_MAP_K4V,
+                    SpeculativeType.NGRAM_MOD,
+                    SpeculativeType.NGRAM_CACHE,
+                ):
+                    spec_kwargs["ngram_size_n"] = config.get("ngram_size_n", 8)
+                    spec_kwargs["ngram_size_m"] = config.get("ngram_size_m", 16)
+                    spec_kwargs["ngram_min_hits"] = config.get("ngram_min_hits", 1)
+                    if valid_speculative_type == SpeculativeType.NGRAM_MAP_K4V:
+                        spec_kwargs["ngram_max_entries_per_key"] = config.get("ngram_max_entries_per_key", 4)
+
+                llm_kwargs["speculative"] = SpecConfig(**spec_kwargs)
+                _debug_print(debug, f"Speculative decoding enabled (type={speculative_type})", t_speculative, file=sys.stderr)
+
+    if chat_handler is not None:
+        # Мультимодальный режим: используем chat_handler
+        llm_kwargs["chat_handler"] = chat_handler
+    else:
+        # Текстовый режим: старый chat_format, если он задан, может кому-то пригодится.
+        if chat_format:
+            llm_kwargs["chat_format"] = chat_format
+
+    llm = Llama(**llm_kwargs)
+
+    # Патчи шаблона чата
+    if chat_handler is not None:
+        if raw_mode:
+            from jinja2 import Template
+
+            simple_format = (
+                "{%- for msg in messages %}"
+                "{%- if msg.role == 'user' %}"
+                "{%- if msg.content is string %}{{ msg.content }}"
+                "{%- elif msg.content is iterable %}"
+                "{%- for part in msg.content %}"
+                "{%- if part.type == 'text' %}{{ part.text }}"
+                "{%- else %}<__media__>"
+                "{%- endif %}"
+                "{%- endfor %}"
+                "{%- endif %}"
+                "{%- endif %}"
+                "{%- endfor %}"
+            )
+            simple_template = Template(simple_format)
+
+            chat_handler.chat_format = simple_format
+            chat_handler.chat_template = simple_template
+
+        # Патч-устранение ошибки generic в дальнейшем удалить
+        elif (chat_handler_type == "generic"
+              and not config.get("external_chat_format")
+              and config.get("generic_patch", True)):
+            gguf_template_str = None
+            try:
+                gguf_template_str = llm.metadata.get("tokenizer.chat_template") # Шаблон из gguf
+            except Exception:
+                gguf_template_str = None
+
+            if isinstance(gguf_template_str, str) and gguf_template_str:
+                from jinja2 import Template
+
+                chat_handler.chat_format = gguf_template_str
+                chat_handler.chat_template = Template(gguf_template_str)
+
+    _debug_print(debug, "load_model (llm)", t_llm, file=sys.stderr)
+    return llm
+
+def _infer_chat(llm, config, images = [], audios = [], videos = []):
+    """
+    Обычный chat-режим (vision или text).
+    """
+    try:
+        debug = config.get("debug", False)
+        streaming_mode = config.get("streaming_mode", False)
+
+        chat_handler_type = _norm_str(config.get("chat_handler"))
+
+        system_prompt = (config.get("system_prompt") or "").strip()
+        user_prompt   = (config.get("user_prompt") or "").strip()
+
+        use_native_llamacpp = config.get("_native_llamacpp", False)
+        is_vision_model = getattr(llm, "chat_handler", None) is not None or (
+            use_native_llamacpp and bool(images or audios or videos))
+
+        # --- 1. completion_kwargs ---
+        completion_kwargs = _prepare_completion_kwargs(config, llm)
+
+        # --- 2. Сообщения ---
+        t_create_message = time.perf_counter()
+
+        if is_vision_model:
+            user_prompt_after_content = config.get("user_prompt_after_content", True)
+            text_before = "" if user_prompt_after_content else user_prompt
+            text_after  = user_prompt if user_prompt_after_content else ""
+
+            content = _build_message_content(
+                config, images, audios, videos,
+                text_before=text_before, text_after=text_after,
+            )
+
+            if system_prompt:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content},
+                ]
+            else:
+                messages = [{"role": "user", "content": content}]
+
+            text_prompt, text_prompt_stop = None, None
+
+        else:
+            if system_prompt:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+            else:
+                messages = [{"role": "user", "content": user_prompt}]
+
+            if use_native_llamacpp:
+                # llama-server applies the model's chat template itself
+                text_prompt, text_prompt_stop = None, None
+            else:
+                text_prompt, text_prompt_stop = _build_text_prompt(
+                    llm, chat_handler_type, messages, config, debug
+                )
+
+        content_text = config.get("_content_text") or ""
+
+        _debug_print(debug, f"create message{content_text}", t_create_message, file=sys.stderr)
+
+        # --- 3. Инференс ---
+        t_inference_start = time.perf_counter()
+
+        if text_prompt is None:
+            if streaming_mode:
+                result = _stream_chat_completion(llm, messages, completion_kwargs)
+            else:
+                result = llm.create_chat_completion(messages=messages, **completion_kwargs)
+            output = result["choices"][0]["message"]["content"]
+        else:
+            if text_prompt_stop:
+                completion_kwargs["stop"] = completion_kwargs.get("stop", []) + list(text_prompt_stop)
+            if streaming_mode:
+                result = _stream_completion(llm, text_prompt, completion_kwargs)
+            else:
+                result = llm.create_completion(prompt=text_prompt, **completion_kwargs)
+            output = result["choices"][0]["text"]
+
+        t_inference_stop = time.perf_counter()
+
+        if debug:
+            completion_tokens, speed = _debug_calc_speed(result, t_inference_stop - t_inference_start)
+            _debug_print(debug, "inference", t_inference_start,
+                         text=f"{speed:.2f} tok/sec {completion_tokens} tokens",
+                         file=sys.stderr)
+
+        # --- 4. Пост-обработка ---
+        speculative_enabled  = config.get("speculative_enabled", False)
+        if speculative_enabled and debug:
+            _debug_speculative_stats(llm)
+
+        output = _postprocess_output(output, config)
+
+        if config.get("debug_output", False):
+            print(f"[DEBUG] LLM output: {output}", file=sys.stderr)
+
+        return {
+            "status": "success", 
+            "output": output, 
+            "data_type": 0
+        }, None
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Chat inference failed: {e}",
+            "traceback": traceback.format_exc(),
+        }, None
+
+def _infer_raw(llm, config, images = [], audios = [], videos = []):
+    """
+    Raw-инференс с пользовательским prompt_template.
+    Если у llm есть chat_handler — используется create_chat_completion с контентом (текст + медиа). 
+    Если handler нет — используется create_completion по строке prompt.
+    """
+    try:
+        debug = config.get("debug", False)
+        streaming_mode = config.get("streaming_mode", False)
+
+        system_prompt = (config.get("system_prompt") or "").strip()
+        user_prompt   = (config.get("user_prompt") or "").strip()
+
+        # --- 1. Готовим prompt_template ---
+        template_str = config.get("prompt_template", "")
+        if not template_str:
+            raise ValueError("raw_mode is enabled but prompt_template is empty. "
+                             "Please provide a valid prompt_template")
+
+        text_before, text_after = build_prompt(template_str, system=system_prompt, user=user_prompt)
+
+        # --- 2. completion_kwargs ---
+        completion_kwargs = _prepare_completion_kwargs(config, llm)
+
+        # --- 3. Инференс ---
+        chat_handler = getattr(llm, "chat_handler", None)
+        use_native_media = config.get("_native_llamacpp", False) and bool(images or audios or videos)
+
+        if chat_handler is not None or use_native_media:
+            # Мультимодальный raw: chat_completion с контентом
+            t_create_raw_prompt = time.perf_counter()
+            content = _build_message_content(
+                config, images, audios, videos,
+                text_before=text_before, text_after=text_after,
+            )
+            messages = [{"role": "user", "content": content}]
+
+            content_text = config.get("_content_text") or ""
+
+            _debug_print(debug, f"create raw prompt{content_text}", t_create_raw_prompt, file=sys.stderr)
+
+            t_inference_start = time.perf_counter()
+            if streaming_mode:
+                result = _stream_chat_completion(llm, messages, completion_kwargs)
+            else:
+                result = llm.create_chat_completion(messages=messages, **completion_kwargs)
+            t_inference_end = time.perf_counter()
+
+            if debug:
+                completion_tokens, speed = _debug_calc_speed(result, t_inference_end - t_inference_start)
+                _debug_print(debug, "inference (raw mtmd)", t_inference_start,
+                             text=f"{speed:.2f} tok/sec {completion_tokens} tokens",
+                             file=sys.stderr)
+
+            output = result["choices"][0]["message"]["content"]
+
+        else:
+            # Текстовый raw: completion по строке prompt
+            t_inference_start = time.perf_counter()
+            prompt_str = text_before + text_after
+            if streaming_mode:
+                result = _stream_completion(llm, prompt_str, completion_kwargs)
+            else:
+                result = llm.create_completion(prompt=prompt_str, **completion_kwargs)
+            t_inference_end = time.perf_counter()
+
+            if debug:
+                completion_tokens, speed = _debug_calc_speed(result, t_inference_end - t_inference_start)
+                _debug_print(debug, "inference (raw text)", t_inference_start,
+                             text=f"{speed:.2f} tok/sec {completion_tokens} tokens",
+                             file=sys.stderr)
+
+            output = result["choices"][0]["text"]
+
+        # --- 4. Пост-обработка ---
+        speculative_enabled  = config.get("speculative_enabled", False)
+        if speculative_enabled and debug:
+            _debug_speculative_stats(llm)
+
+        output = _postprocess_output(output, config)
+
+        if config.get("debug_output", False):
+            print(f"[DEBUG] LLM output: {output}", file=sys.stderr)
+
+        return {
+            "status": "success", 
+            "output": output, 
+            "data_type": 0
+        }, None
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Raw inference failed: {e}",
+            "traceback": traceback.format_exc(),
+        }, None
+
+# =====================================================================
+# LLM COMPLETION HELPERS
+# =====================================================================
+
+def _prepare_completion_kwargs(config, llm):
+    """
+    Собирает completion_kwargs: sampling + stop + logit_bias + penalty + extras.
+    Работает одинаково для chat и raw.
+    """
+    completion_kwargs = {
+        "max_tokens":        config.get("max_tokens", config.get("output_max_tokens", 2048)),
+        "temperature":       config.get("temperature", 0.7),
+        "seed":              config.get("seed", 42),
+        "repeat_penalty":    config.get("repeat_penalty", 1.1),
+        "frequency_penalty": config.get("frequency_penalty", 0.0),
+        "top_p":             config.get("top_p", 0.92),
+        "min_p":             config.get("min_p", 0.05),
+        "top_k":             config.get("top_k", 0),
+    }
+
+    custom_stop = _parse_strings_list(config.get("stop"))
+    if custom_stop:
+        completion_kwargs["stop"] = custom_stop
+
+    # Нежелательные слова → logit_bias
+    words_to_ban = _parse_strings_list(config.get("words_to_ban"))
+    if words_to_ban:
+        banned_token_ids = []
+
+        for word in words_to_ban:
+            # Убираем лишние пробелы по краям самого слова
+            word = word.strip()
+            if not word:
+                continue
+
+            # Уникальные варианты для токенизации (BPE + пробел)
+            variants = {word, " " + word}
+            for variant in variants:
+                try:
+                    tokens = llm.tokenize(variant.encode("utf-8"), add_bos=False)
+                    banned_token_ids.extend(tokens)
+                except Exception as e:
+                    print(f"[LogitBias Warning] Failed to tokenize '{variant}': {e}", file=sys.stderr)
+
+        unique_banned_ids = list(set(banned_token_ids))
+        if unique_banned_ids:
+            completion_kwargs["logit_bias"] = {int(t): -100.0 for t in unique_banned_ids}
+
+    # presence_penalty/present_penalty patch: параметр менял имя между версиями llama_cpp_python
+    present_penalty = config.get("presence_penalty", config.get("present_penalty", 0.0))
+    method = llm.create_chat_completion
+    if hasattr(method, "__func__") and hasattr(method.__func__, "__code__"):
+        func = method.__func__
+        allowed_args = func.__code__.co_varnames[1:func.__code__.co_argcount]
+        if "presence_penalty" in allowed_args:
+            completion_kwargs["presence_penalty"] = present_penalty
+        elif "present_penalty" in allowed_args:
+            completion_kwargs["present_penalty"] = present_penalty
+    else:
+        completion_kwargs["present_penalty"] = present_penalty
+
+    # Пробрасываем кастомные параметры extra_completion_*
+    for key, value in config.items():
+        if key.startswith("extra_completion_"):
+            new_key = key[len("extra_completion_"):]
+            completion_kwargs[new_key] = value
+
+    return completion_kwargs
+
+def _postprocess_output(output, config):
+    """
+    Убирает think/channel-блоки, срезает пользовательский разделитель,
+    схлопывает пустые строки. Уважает raw_output.
+    """
+    if config.get("raw_output", False):
+        return output
+
+    if config.get("remove_thinking", False):
+        # 1. Отрезаем пользовательский разделитель
+        cut_prefix = config.get("answer_delimiter")
+        if cut_prefix and cut_prefix in output:
+            output = output.split(cut_prefix)[-1]
+
+        # 2. Удаляем think-блоки
+        output = re.sub(r'<think>.*?</think>', '', output, flags=re.DOTALL)
+        if '</think>' in output:
+            output = output.split('</think>')[-1]
+
+        # 3. Удаляем channel-блоки
+        output = re.sub(r'<\|channel>.*?<channel\|>', '', output, flags=re.DOTALL)
+        if '<channel|>' in output:
+            output = output.split('<channel|>')[-1]
+
+        # 4. Схлопываем множественные пустые строки в одну
+        output = re.sub(r'\n\s*\n+', '\n\n', output)
+
+    # 5. Удаляем пустые строки в начале и конце
+    return output.strip()
+
+def _debug_speculative_stats(llm):
+    """
+    Печатает статистику speculative decoding, если она есть у llm.
+    """
+    if not hasattr(llm, "last_speculative_stats"):
+        return
+
+    spec_stats = llm.last_speculative_stats
+    if not spec_stats:
+        return
+
+    rate = spec_stats.get('draft_token_acceptance_rate', 0)
+    mean_length = spec_stats.get('mean_accepted_length', 0)
+    tok_sec = spec_stats.get('generation_tokens_per_second', 0)
+
+    print(f"[DEBUG] speculative stats: "
+          f"Accept: {rate:.1%}, MeanLen: {mean_length:.1f}, Speed: {tok_sec:.2f} tok/sec",
+          file=sys.stderr)
+
+def _build_message_content(config, images, audios, videos, text_before="", text_after=""):
+    """
+    Собирает content-массив chat-сообщения.
+    Порядок медиа единый и фиксированный: images -> audios -> videos.
+    text_before / text_after — текст до и после всего медиа-блока.
+    """
+    content = []
+
+    if text_before:
+        content.append({"type": "text", "text": text_before})
+
+    image_id = config.get("add_image_id") or ""
+    if isinstance(image_id, str):
+        image_id = image_id.strip()
+    audio_id = config.get("add_audio_id", "").strip()
+
+    num = 1
+    image_slots = config.get("image_slots") or []
+    template_counts = {}
+    for img_item in images:
+        img_content = _build_image_content(img_item, config)
+        if img_content is None:
+            continue
+        if isinstance(image_id, dict):
+            slot = image_slots[num - 1] if num <= len(image_slots) else None
+            template = image_id.get(slot)
+            if template:
+                # {num} counts images sharing the same template, across slots and batches
+                template_counts[template] = template_counts.get(template, 0) + 1
+                content.append({"type": "text", "text": template.replace("{num}", str(template_counts[template]))})
+        elif image_id:
+            content.append({"type": "text", "text": image_id.replace("{num}", str(num))})
+        content.append(img_content)
+        num += 1
+
+    num = 0
+    for aud_item in audios:
+        aud_content = _build_audio_content(aud_item, config)
+        if aud_content is None:
+            continue
+        if audio_id:
+            content.append({"type": "text", "text": audio_id.replace("{num}", str(num))})
+        content.append(aud_content)
+        num += 1
+
+    num = 0
+    for path in videos:
+        frames_items = _build_video_content(path, config, num)
+        if not frames_items:
+            continue
+        content.extend(frames_items)
+        num += 1
+
+    if text_after:
+        content.append({"type": "text", "text": text_after})
+
+    return content
+
+# =====================================================================
+# INFERENCE
+# =====================================================================
 
 def _inference(config):
     """Внутренняя функция, выполняющая инференс с кешированием модели."""
     try:
+        config = dict(config)   # копия, чтобы не мутировать вход
+
         debug = config.get("debug", False)
-        verbose = config.get("verbose", False)
-        streaming_mode = config.get("streaming_mode", False)
+
+        gccollect = config.get("force_gc_unload", False)
+        raw_mode = config.get("raw_mode", False)
+
+        is_embedding = config.get("extract_embedding", False)
+        is_multimodal_embedding = config.get("extract_multimodal_embedding", False)
+        is_tts = config.get("extract_tts", False)
 
         # Native llama-server backend (utils.Llama adapter)
         llama_server_url = config.get("llama_server_url")
-        use_native_llamacpp = bool(config.get("llama_server_path") or llama_server_url) and not config.get("extract_tts", False)
-        if use_native_llamacpp and streaming_mode:
+        use_native_llamacpp = bool(config.get("llama_server_path") or llama_server_url) and not is_tts
+        config["_native_llamacpp"] = use_native_llamacpp
+        if use_native_llamacpp and config.get("streaming_mode", False):
             print("[native-llama.cpp] streaming_mode is not supported, disabled", file=sys.stderr)
-            streaming_mode = False
-
-        chat_handler_type = _norm_str(config.get("chat_handler"))
-        chat_format = _norm_str(config.get("chat_format"))
-
-        gccollect = config.get("force_gc_unload", False)
-        image_min_tokens = _norm_default(config.get("image_min_tokens"), 0)
-        image_max_tokens = _norm_default(config.get("image_max_tokens"), 0)
-        extract_embedding = config.get("extract_embedding", False)
-        speculative_enabled = config.get("speculative_enabled", False)
-        extract_tts = config.get("extract_tts", False)
-        raw_mode = config.get("raw_mode", False)
-
-        # --- Проверка обязательных полей ---
-        model_path = config.get("model_path", "").strip()
-        if not model_path and not llama_server_url:
-            return {"status": "error", "message": "Missing or invalid field: model_path"}, None
-
-        system_prompt = config.get("system_prompt", "").strip()
-        user_prompt = config.get("user_prompt", "").strip()
-        image_quality = config.get("image_quality", 95)
+            config["streaming_mode"] = False
 
         cuda_device = _norm_default(config.get("cuda_device", ""), "")
         if cuda_device is not None:
@@ -505,43 +1852,20 @@ def _inference(config):
         num_videos=len(videos)
 
         num_content = num_images + num_audios + num_videos
+        if num_content:
+            config["_content_text"] = f" (with {num_images}/{num_audios}/{num_videos} image/audio/video)"
 
         add_vision_id = _norm_3state_bool(config.get("add_vision_id"))
         if add_vision_id is None:
             add_vision_id = (num_images != 1) or (num_videos > 0)
+        config["add_vision_id"] = add_vision_id
 
-        content_text = ""
-        if num_content:
-            content_text = f"(with {num_images}/{num_audios}/{num_videos} image/audio/video)"        
-
-        ### IMPORT ###
-
-        t0 = time.perf_counter()
-
-        if extract_embedding:
-            from llama_cpp.llama_embedding import LlamaEmbedding, LLAMA_POOLING_TYPE_NONE
-        elif use_native_llamacpp:
-            from utils import Llama
-        else:
-            from llama_cpp import Llama
-            if extract_tts:
-                from llama_cpp.llama_multimodal import MTMDAudioGenerator 
-                from llama_cpp.llama_embedding import LLAMA_POOLING_TYPE_NONE
-
-        if speculative_enabled:
-            try:
-                from llama_cpp.llama_speculative import SpecConfig, SpeculativeType
-            except ImportError:
-                SpecConfig = None
-                SpeculativeType = None
-                speculative_enabled = False
-
-        _debug_print(debug, "import llama_cpp", t0, file=sys.stderr)
-
-        mmproj_path = config.get("mmproj_path", "").strip()
-        is_vision_model = bool(num_content > 0 and (mmproj_path or llama_server_url) and extract_embedding == False)
-
-        if config.get("force_mmproj", True) and mmproj_path:
+        is_vision_model = False
+        mmproj_path = (config.get("mmproj_path") or "").strip()
+        if mmproj_path:
+            if num_content > 0 or config.get("force_mmproj", True):
+                is_vision_model = True
+        elif llama_server_url and num_content > 0:
             is_vision_model = True
 
         if need_new_model:
@@ -551,380 +1875,24 @@ def _inference(config):
             # Выгружаем старую модель
             unload_llama_model(gccollect, debug, target=cache_mode)
 
-            chat_handler = None
+            if is_multimodal_embedding:
+                current_cache["llm"] = _load_multimodal_embedder(config)
 
-            if is_vision_model and not extract_tts and not use_native_llamacpp:
-                t0 = time.perf_counter()
+            elif is_embedding: # Обязательно вторым, так как флаги is_embedding и is_multimodal_embedding приходят вместе
+                current_cache["llm"] = _load_text_embedder(config)
 
-                if not chat_handler_type:
-                    return {"status": "error", "message": "chat_handler is not set"}, None
+            elif is_tts:
+                current_cache["llm"] = _load_tts_llm(config)
 
-                handler_kwargs = {
-                    "clip_model_path": mmproj_path,
-                    "verbose": verbose,
-                }
-
-                if image_min_tokens is not None:
-                    handler_kwargs["image_min_tokens"] = image_min_tokens
-
-                if image_max_tokens is not None:
-                    handler_kwargs["image_max_tokens"] = image_max_tokens
-
-                for key, value in config.items():
-                    if key.startswith("extra_chat_handler_"):
-                        new_key = key[len("extra_chat_handler_"):]
-                        handler_kwargs[new_key] = value
-                        #print(f"extra chat handler kwargs: {new_key} = {value}", file=sys.stderr)
-
-                extra_handler_kwargs = {}
-
-                if chat_handler_type == "gemma4":
-                    try:
-                        from llama_cpp.llama_chat_format import Gemma4ChatHandler
-                    except ImportError:
-                        return {"status": "error", "message": "You have an outdated version of the llama-cpp-python library. Gemma4 requires version v0.3.35 or higher."}, None
-                    extra_handler_kwargs = {
-                        "enable_thinking": config.get("enable_thinking", False),
-                    }
-                    chat_handler = Gemma4ChatHandler(**handler_kwargs, **extra_handler_kwargs)
-
-                elif chat_handler_type == "qwen35":
-                    try:
-                        from llama_cpp.llama_chat_format import Qwen35ChatHandler
-                    except ImportError:
-                        return {"status": "error", "message": "You have an outdated version of the llama-cpp-python library. Qwen3.5 requires version v0.3.30 or higher."}, None
-                    extra_handler_kwargs = {
-                        "enable_thinking": config.get("enable_thinking", False),
-                        "add_vision_id": add_vision_id,
-                    }
-                    chat_handler = Qwen35ChatHandler(**handler_kwargs, **extra_handler_kwargs)
-
-                elif chat_handler_type == "qwen3":
-                    try:
-                        from llama_cpp.llama_chat_format import Qwen3VLChatHandler
-                    except ImportError:
-                        return {"status": "error", "message": "You have an outdated version of the llama-cpp-python library. Qwen3 requires version v0.3.17 or higher."}, None
-                    extra_handler_kwargs = {
-                        "force_reasoning": config.get("force_reasoning", False),
-                        "add_vision_id": add_vision_id,
-                    }
-                    chat_handler = Qwen3VLChatHandler(**handler_kwargs, **extra_handler_kwargs)
-
-                elif chat_handler_type == "qwen3asr":
-                    from llama_cpp.llama_chat_format import Qwen3ASRChatHandler
-                    chat_handler = Qwen3ASRChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "qwen25":
-                    from llama_cpp.llama_chat_format import Qwen25VLChatHandler
-                    chat_handler = Qwen25VLChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "generic":
-                    from llama_cpp.llama_chat_format import GenericMTMDChatHandler
-                    extra_handler_kwargs = {
-                        "mmproj_path": mmproj_path,
-                        "chat_format": chat_format,
-                        "verbose": verbose,
-                    }
-                    chat_handler = GenericMTMDChatHandler(**extra_handler_kwargs)
-
-                elif chat_handler_type == "gemma3":
-                    from llama_cpp.llama_chat_format import Gemma3ChatHandler
-                    chat_handler = Gemma3ChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "llava15":
-                    from llama_cpp.llama_chat_format import Llava15ChatHandler
-                    chat_handler = Llava15ChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "llava16":
-                    from llama_cpp.llama_chat_format import Llava16ChatHandler
-                    chat_handler = Llava16ChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "moondream":
-                    from llama_cpp.llama_chat_format import MoondreamChatHandler
-                    chat_handler = MoondreamChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "minicpmv26":
-                    from llama_cpp.llama_chat_format import MiniCPMv26ChatHandler
-                    chat_handler = MiniCPMv26ChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "minicpmv45":
-                    from llama_cpp.llama_chat_format import MiniCPMv45ChatHandler
-                    extra_handler_kwargs = {
-                        "enable_thinking": config.get("enable_thinking", True),
-                    }
-                    chat_handler = MiniCPMv45ChatHandler(**handler_kwargs, **extra_handler_kwargs)
-
-                elif chat_handler_type == "minicpmv46":
-                    from llama_cpp.llama_chat_format import MiniCPMv46ChatHandler
-                    extra_handler_kwargs = {
-                        "enable_thinking": config.get("enable_thinking", True),
-                    }
-                    chat_handler = MiniCPMv46ChatHandler(**handler_kwargs, **extra_handler_kwargs)
-
-                elif chat_handler_type == "glm41v":
-                    from llama_cpp.llama_chat_format import GLM41VChatHandler
-                    chat_handler = GLM41VChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "glm46v":
-                    from llama_cpp.llama_chat_format import GLM46VChatHandler
-                    extra_handler_kwargs = {
-                        "enable_thinking": config.get("enable_thinking", True),
-                    }
-                    chat_handler = GLM46VChatHandler(**handler_kwargs, **extra_handler_kwargs)
-
-                elif chat_handler_type == "granite":
-                    from llama_cpp.llama_chat_format import GraniteDoclingChatHandler
-                    extra_handler_kwargs = {
-                        "controls": config.get("granite_controls", None),
-                    }
-                    chat_handler = GraniteDoclingChatHandler(**handler_kwargs, **extra_handler_kwargs)
-
-                elif chat_handler_type == "lfm2vl":
-                    from llama_cpp.llama_chat_format import LFM2VLChatHandler
-                    chat_handler = LFM2VLChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "lfm25vl":
-                    from llama_cpp.llama_chat_format import LFM25VLChatHandler
-                    chat_handler = LFM25VLChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "paddleocr":
-                    from llama_cpp.llama_chat_format import PaddleOCRChatHandler
-                    chat_handler = PaddleOCRChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "obsidian":
-                    from llama_cpp.llama_chat_format import ObsidianChatHandler
-                    chat_handler = ObsidianChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "nanollava":
-                    from llama_cpp.llama_chat_format import NanoLlavaChatHandler
-                    chat_handler = NanoLlavaChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "llama3visionalpha":
-                    from llama_cpp.llama_chat_format import Llama3VisionAlphaChatHandler
-                    chat_handler = Llama3VisionAlphaChatHandler(**handler_kwargs)
-
-                elif chat_handler_type == "step3vl":
-                    from llama_cpp.llama_chat_format import Step3VLChatHandler
-                    extra_handler_kwargs = {
-                        "enable_thinking": config.get("enable_thinking", True),
-                    }
-                    chat_handler = Step3VLChatHandler(**handler_kwargs, **extra_handler_kwargs)
-
-                else:
-                    return {"status": "error", "message": f"Unknown chat handler type: {chat_handler_type}"}, None
-
-                _debug_print(debug, "create_chat_handler", t0, file=sys.stderr)
-
-            t1 = time.perf_counter()
-
-            if not extract_embedding and not extract_tts:
-
-                # Параметры Llama
-                llm_kwargs = {
-                    "model_path": model_path,
-                    "n_ctx": config.get("n_ctx", config.get("ctx", 8192)), #n_ctx or ctx - old name
-                    "n_batch": config.get("n_batch", 2048),
-                    "n_ubatch": config.get("n_ubatch", 512),
-                    "n_keep": config.get("n_keep", 256),
-                    "swa_full": config.get("swa_full", False),
-                    "verbose": verbose,
-                    "pool_size": config.get("pool_size", 4194304),
-                    "n_threads": config.get("n_threads", config.get("cpu_threads", 8)), #n_threads or cpu_threads - old name
-                    "n_gpu_layers": config.get("n_gpu_layers", config.get("gpu_layers", -1)), #n_gpu_layers or gpu_layers - old name
-                    "split_mode": config.get("split_mode", 0),
-                    "main_gpu": config.get("main_gpu", 0),
-                    "ctx_checkpoints": config.get("ctx_checkpoints", 0),   
-                    "checkpoint_on_device": config.get("checkpoint_on_device", False),   
-                    "logits_all": config.get("logits_all", False),
-                    "n_cpu_moe": config.get("n_cpu_moe", 0),
-                    "cpu_moe": config.get("cpu_moe", False),
-                    "use_mmap": config.get("use_mmap", False),
-                    "use_mlock": config.get("use_mlock", False),
-                    "offload_kqv": config.get("offload_kqv", True),
-                }
-
-                tensor_split = _parse_float_list(config.get("tensor_split"))
-                if tensor_split:
-                    llm_kwargs["tensor_split"] = tensor_split
-
-                if (type_k := _norm_default(config.get("type_k"), 1)) is not None:
-                    llm_kwargs["type_k"] = type_k     
-
-                if (type_v := _norm_default(config.get("type_v"), 1)) is not None:
-                    llm_kwargs["type_v"] = type_v 
-
-                if (flash_attn_type := _norm_default(config.get("flash_attn_type"), -1)) is not None:
-                    llm_kwargs["flash_attn_type"] = flash_attn_type            
-
-                for key, value in config.items():
-                    if key.startswith("extra_llama_"):
-                        new_key = key[len("extra_llama_"):]
-                        llm_kwargs[new_key] = value
-                        #print(f"extra llm kwargs: {new_key} = {value}", file=sys.stderr)
-
-                if use_native_llamacpp:
-                    llm_kwargs["_native_config"] = config
-
-                ### SPECULATIVE ###
-                # 0=NONE - no speculative decoding
-                #
-                # draft-family (model-based)
-                # 1=DRAFT_SIMPLE  = 1   # standalone draft model speculative decoding
-                # 2=DRAFT_EAGLE3  = 2   # Eagle3 speculative decoding
-                # 3=DRAFT_MTP     = 3   # Multi-token prediction
-                # 4=DRAFT_DFLASH  = 4   # DFlash speculative decoding
-                # 5=DRAFT_DSPARK  = 5   # DSpark speculative decoding
-                #
-                # ngram-family (statistical)
-                # 6=NGRAM_SIMPLE  = 6   # simple self-speculative decoding based on n-grams
-                # 7=NGRAM_MAP_K   = 7   # self-speculative decoding with n-gram keys only
-                # 8=NGRAM_MAP_K4V = 8   # self-speculative decoding with n-gram keys and 4 m-gram values
-                # 9=NGRAM_MOD     = 9   # self-speculative decoding with n-gram mod
-                # 10=NGRAM_CACHE   = 10  # self-speculative decoding with 3-level n-gram cache
-
-                if speculative_enabled:
-
-                    t_speculative = time.perf_counter()
-
-                    speculative_type = int(config.get("speculative_type", 3)) 
-                    try:
-                        valid_speculative_type = SpeculativeType(speculative_type)
-                    except ValueError:
-                        speculative_enabled = False
-                 
-                    if speculative_enabled:
-                        spec_kwargs = {
-                            "spec_type": valid_speculative_type,
-                            "draft_n_max": config.get("draft_n_max", 2),
-                            "draft_p_min": config.get("draft_p_min", 0.0),
-                        }
-                         
-                        # Параметры для внешних черновых моделей
-                        draft_model_path = config.get("draft_model_path", "").strip()
-                        if draft_model_path:
-                            spec_kwargs["draft_model_path"] = draft_model_path
-                            spec_kwargs["draft_n_gpu_layers"] = config.get("draft_n_gpu_layers", -1)
-                            spec_kwargs["draft_backend_sampling"] = config.get("draft_backend_sampling", True)
-
-                        # Параметры для N-gram семейства
-                        if valid_speculative_type in (SpeculativeType.NGRAM_SIMPLE, SpeculativeType.NGRAM_MAP_K, SpeculativeType.NGRAM_MAP_K4V, SpeculativeType.NGRAM_MOD, SpeculativeType.NGRAM_CACHE):
-                            spec_kwargs["ngram_size_n"] = config.get("ngram_size_n", 8)
-                            spec_kwargs["ngram_size_m"] = config.get("ngram_size_m", 16)
-                            spec_kwargs["ngram_min_hits"] = config.get("ngram_min_hits", 1)
-                            if valid_speculative_type == SpeculativeType.NGRAM_MAP_K4V:
-                                spec_kwargs["ngram_max_entries_per_key"] = config.get("ngram_max_entries_per_key", 4)
-
-                        llm_kwargs["speculative"] = SpecConfig(**spec_kwargs)                     
-                             
-                        _debug_print(debug, f"Speculative decoding enabled (type={speculative_type})", t_speculative, file=sys.stderr)
-
-                if chat_handler is not None:
-                    # Мультимодальный режим: используем chat_handler
-                    llm_kwargs["chat_handler"] = chat_handler
-
-                    if image_min_tokens is not None:
-                        llm_kwargs["image_min_tokens"] = image_min_tokens
-
-                    if image_max_tokens is not None:
-                        llm_kwargs["image_max_tokens"] = image_max_tokens
-
-                else:
-                    # Текстовый режим: добавляем chat_format, если он задан
-                    if config.get("chat_format_from_gguf", False):
-                        llm_kwargs["chat_format"] = "chat_template.default"
-
-                    elif chat_format:
-                        llm_kwargs["chat_format"] = chat_format 
-
-                current_cache["llm"] = Llama(**llm_kwargs)
-                
-                if chat_handler is not None:
-
-                    if config.get("chat_format_from_gguf", False):
-
-                        from jinja2 import Template
-
-                        gguf_original_template_string = current_cache["llm"].metadata.get('tokenizer.chat_template', None)
-                        gguf_original_template = Template(gguf_original_template_string)
-
-                        # Подмена, но это не работает
-                        chat_handler.chat_template = gguf_original_template
-
-                    elif raw_mode:
-
-                        from jinja2 import Template
-
-                        # Минимальный шаблон 
-                        simple_template = Template(
-                            "{%- for msg in messages %}"
-                            "{%- if msg.role == 'user' %}"
-                            "{%- if msg.content is string %}{{ msg.content }}"
-                            "{%- elif msg.content is iterable %}"
-                            "{%- for part in msg.content %}"
-                            "{%- if part.type == 'image_url' %}<__media__>{%- endif %}"
-                            "{%- if part.type == 'text' %}{{ part.text }}{%- endif %}"
-                            "{%- endfor %}"
-                            "{%- endif %}"
-                            "{%- endif %}"
-                            "{%- endfor %}"
-                        )
-
-                        # Подмена, это работает
-                        chat_handler.chat_template = simple_template
-
-            elif extract_embedding:
-
-                llm_kwargs = {
-                    "model_path": model_path,
-                    "n_ctx": config.get("n_ctx", config.get("ctx", 8192)),
-                    "n_batch": config.get("n_batch", 2048),
-                    "n_ubatch": config.get("n_ubatch", 512),
-                    "n_keep": config.get("n_keep", 256),
-                    "verbose": verbose,
-                    "n_gpu_layers": config.get("n_gpu_layers", config.get("gpu_layers", -1)),
-                    "pooling_type": config.get("pooling_type", LLAMA_POOLING_TYPE_NONE)
-                }
-
-                for key, value in config.items():
-                    if key.startswith("extra_llama_"):
-                        new_key = key[len("extra_llama_"):]
-                        llm_kwargs[new_key] = value
-                        #print(f"extra llm kwargs: {new_key} = {value}", file=sys.stderr)
-
-                current_cache["llm"] = LlamaEmbedding(**llm_kwargs)
-
-            else: #extract_tts
-
-                # Собираем базовые аргументы для LLM
-                llm_kwargs = {
-                    "model_path": model_path,
-                    "n_ctx": config.get("n_ctx", config.get("ctx", 8192)),
-                    "n_batch": config.get("n_batch", 2048),
-                    "n_ubatch": config.get("n_ubatch", 512),
-                    # параметры для TTS (v0.4.0)
-                    "embeddings": True, 
-                    "pooling_type": config.get("pooling_type", LLAMA_POOLING_TYPE_NONE),
-                    "use_mmap": config.get("use_mmap", False),
-                    "verbose": verbose,
-                    "n_gpu_layers": config.get("n_gpu_layers", config.get("gpu_layers", -1)),
-                }
-
-                # Пробрасываем кастомные параметры
-                for key, value in config.items():
-                    if key.startswith("extra_llama_"):
-                        new_key = key[len("extra_llama_"):]
-                        llm_kwargs[new_key] = value
-                        #print(f"extra llm kwargs: {new_key} = {value}", file=sys.stderr)
-
-                # Инициализируем стандартный класс Llama
-                current_cache["llm"] = Llama(**llm_kwargs)        
+            else:
+                current_cache["llm"] = _load_llm(config, is_vision_model)
 
             current_cache["hash"] = current_hash
-            _debug_print(debug, "load_model", t1, file=sys.stderr)
 
         else:
             # Используем закешированную модель
             
+            # Чистка кеша
             if config.get("clearing_cache", True):
                 t2 = time.perf_counter()
                 current_cache["llm"]._ctx.memory_clear(True)
@@ -935,380 +1903,23 @@ def _inference(config):
                 else:
                     _debug_print(debug, "clearing cache", t2, file=sys.stderr)
 
-        output = ""
-        output_data = None
-        data_type = 0
-        if (not extract_embedding) and (not extract_tts):
+        # --- Инференс ---
 
-            completion_kwargs = {
-                "max_tokens": config.get("max_tokens", config.get("output_max_tokens", 2048)),
-                "temperature": config.get("temperature", 0.7),
-                "seed": config.get("seed", 42),
-                "repeat_penalty": config.get("repeat_penalty", 1.1),
-                "frequency_penalty": config.get("frequency_penalty", 0.0),
-                "top_p": config.get("top_p", 0.92),
-                "min_p": config.get("min_p", 0.05),
-                "top_k": config.get("top_k", 0),
-            }
-
-            custom_stop = _parse_strings_list(config.get("stop"))
-            if custom_stop:
-                completion_kwargs["stop"] = custom_stop
-
-            # Нежелательные слова 
-            words_to_ban = _parse_strings_list(config.get("words_to_ban"))
-            if words_to_ban:
-                banned_token_ids = []
-                llm = current_cache["llm"]
+        if is_multimodal_embedding:
+            return _infer_multimodal_embedding(current_cache["llm"], config, images=images)
                 
-                for word in words_to_ban:
-                    # Убираем лишние пробелы по краям самого слова, чтобы избежать "  hello"
-                    word = word.strip()
-                    if not word:
-                        continue
-                        
-                    # Уникальные варианты для токенизации
-                    variants = {word}
-                    variants.add(" " + word)  # Пробел для BPE
-                    
-                    for variant in variants:
-                        try:
-                            tokens = llm.tokenize(variant.encode('utf-8'), add_bos=False)
-                            banned_token_ids.extend(tokens)
-                        except Exception as e:
-                            print(f"[LogitBias Warning] Failed to tokenize '{variant}': {e}")
+        elif is_embedding: # Обязательно вторым, так как флаги is_embedding и is_multimodal_embedding приходят вместе
+            return _infer_text_embedding(current_cache["llm"], config)
 
-                unique_banned_ids = list(set(banned_token_ids))
-                logit_bias_dict = {int(token_id): -100.0 for token_id in unique_banned_ids}
-                
-                if logit_bias_dict:
-                    completion_kwargs["logit_bias"] = logit_bias_dict
+        elif is_tts:
+            return _infer_tts(current_cache["llm"], config, audios=audios)
 
-            #present_penalty/presence_penalty issue
-            present_penalty = config.get("presence_penalty", config.get("present_penalty", 0.0))
-            method = current_cache["llm"].create_chat_completion
-            if hasattr(method, "__func__") and hasattr(method.__func__, "__code__"):
-                func = method.__func__
-                allowed_args = func.__code__.co_varnames[1:func.__code__.co_argcount]
-                if "presence_penalty" in allowed_args:
-                    completion_kwargs["presence_penalty"] = present_penalty
-                elif "present_penalty" in allowed_args:
-                    completion_kwargs["present_penalty"] = present_penalty
-            else:
-                completion_kwargs["present_penalty"] = present_penalty
-
-            for key, value in config.items():
-                if key.startswith("extra_completion_"):
-                    new_key = key[len("extra_completion_"):]
-                    completion_kwargs[new_key] = value
-                    #print(f"extra completion kwargs: {new_key} = {value}", file=sys.stderr)
-
+        else:
             if raw_mode:
+                return _infer_raw(current_cache["llm"], config, images=images, audios=audios, videos=videos)
 
-                # Формируем сообщения для чата
-
-                template_str = config.get("prompt_template", "")
-                if not template_str:
-                    raise ValueError("raw_mode is enabled but prompt_template is empty. Please provide a valid prompt_template")
-
-                # 1. Разбиваем шаблон на части
-                text_before, text_after = build_prompt(template_str, system=system_prompt, user=user_prompt)
-
-                chat_handler = getattr(current_cache["llm"], "chat_handler", None)        
-                if chat_handler is not None:
-
-                    t3 = time.perf_counter()
-
-                    # 2. Собираем content
-                    content = [{"type": "text", "text": text_before}]
-                    for img_item in images:
-                        img_content = _build_image_content(img_item, quality=image_quality)
-                        if img_content is not None:
-                            content.append(img_content)
-
-                    # Пока аудио в raw режиме не работает
-                    #for aud_item in audios:
-                    #    aud_content = _build_audio_content(aud_item)
-                    #    if aud_content is not None:
-                    #        content.append(aud_content)
-
-                    for path in videos:
-                        frames_items = _build_video_content(path, config)
-                        if frames_items is not None:
-                            content.extend(frames_items) 
-
-                    content.append({"type": "text", "text": text_after})
-
-                    messages = [{"role": "user", "content": content}]
-
-                    _debug_print(debug, f"create raw prompt {content_text}", t3, file=sys.stderr)
-
-                    t_inference0 = time.perf_counter()
-                    if streaming_mode:
-                        result = _stream_chat_completion(current_cache["llm"], messages, completion_kwargs, debug)
-                    else:
-                        result = current_cache["llm"].create_chat_completion(messages=messages, **completion_kwargs)
-                    t_inference1 = time.perf_counter()
-
-                    if debug:
-                        completion_tokens, speed = _debug_calc_speed(result, t_inference1 - t_inference0)
-                        _debug_print(debug, "inference (raw)", t_inference0, text=f"{speed:.2f} tok/sec {completion_tokens} tokens", file=sys.stderr)
-
-                    output = result["choices"][0]["message"]["content"]
-
-                else: #chat_handler = None
-
-                    # Текстовый режим
-
-                    t_inference0 = time.perf_counter()
-                    result = current_cache["llm"].create_completion(
-                        prompt=text_before + text_after,
-                        **completion_kwargs
-                    )
-                    t_inference1 = time.perf_counter()
-
-                    if debug:
-                        completion_tokens, speed = _debug_calc_speed(result, t_inference1 - t_inference0)
-                        _debug_print(debug, "inference (raw text)", t_inference0, text=f"{speed:.2f} tok/sec {completion_tokens} tokens", file=sys.stderr)
-
-                    output = result["choices"][0]["text"]
-
-            else: #raw_mode = false
-
-                # Формируем сообщения для чата
-                t3 = time.perf_counter()
-
-                if is_vision_model:
-
-                    content = []
-
-                    user_prompt_after_content = config.get("user_prompt_after_content", True)
-                    image_id = _norm_default(config.get("add_image_id", ""), "")
-                    audio_id = _norm_default(config.get("add_audio_id", ""), "")
-
-                    if not user_prompt_after_content:
-                        content.append({"type": "text", "text": user_prompt})
-
-                    num = 1
-                    image_slots = config.get("image_slots") or []
-                    template_counts = {}
-                    for img_item in images:
-                        img_content = _build_image_content(img_item, quality=image_quality)
-                        if img_content is not None:
-                            if isinstance(image_id, dict):
-                                slot = image_slots[num - 1] if num <= len(image_slots) else None
-                                template = image_id.get(slot)
-                                if template:
-                                    # {num} counts images sharing the same template, across slots and batches
-                                    template_counts[template] = template_counts.get(template, 0) + 1
-                                    content.append({"type": "text", "text": template.replace("{num}", str(template_counts[template]))})
-                            elif image_id:
-                                content.append({"type": "text", "text": image_id.replace("{num}", str(num))})
-                            content.append(img_content)     
-                            num += 1                   
-
-                    num = 0
-                    for aud_item in audios:
-                        aud_content = _build_audio_content(aud_item)
-                        if aud_content is not None:
-                            if audio_id:
-                                content.append({"type": "text", "text": audio_id.replace("{num}", str(num))})
-                            content.append(aud_content)
-                            num += 1     
-
-                    for path in videos:
-                        frames_items = _build_video_content(path, config)
-                        if frames_items is not None:
-                            content.extend(frames_items) 
-
-                    if user_prompt_after_content:
-                        content.append({"type": "text", "text": user_prompt})
-
-                    if system_prompt:
-                        messages = [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": content}
-                        ]
-                    else:
-                        messages = [
-                            {"role": "user", "content": content}
-                        ]
-
-                else:
-                    if system_prompt:
-                        messages = [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ]
-                    else:
-                        messages = [
-                            {"role": "user", "content": user_prompt}
-                        ]
-
-                _debug_print(debug, f"create message {content_text}", t3, file=sys.stderr)
-
-                # --- Инференс ---
-
-                t_inference0 = time.perf_counter()
-                if streaming_mode:
-                    result = _stream_chat_completion(current_cache["llm"], messages, completion_kwargs, debug)
-                else:
-                    result = current_cache["llm"].create_chat_completion(messages=messages, **completion_kwargs)
-                t_inference1 = time.perf_counter()
-
-                if debug:
-                    completion_tokens, speed = _debug_calc_speed(result, t_inference1 - t_inference0)
-                    _debug_print(debug, "inference", t_inference0, text=f"{speed:.2f} tok/sec {completion_tokens} tokens", file=sys.stderr)
-
-                output = result["choices"][0]["message"]["content"]
-
-            ### SPECULATIVE ###
-            if speculative_enabled and debug:
-                if hasattr(current_cache["llm"], "last_speculative_stats"):
-                    spec_stats = current_cache["llm"].last_speculative_stats
-                    if spec_stats:
-                        rate = spec_stats.get('draft_token_acceptance_rate', 0)
-                        mean_length = spec_stats.get('mean_accepted_length', 0)
-                        tok_sec = spec_stats.get('generation_tokens_per_second', 0)
-
-                        _debug_info(debug, "speculative stats", 
-                            text=f"Accept: {rate:.1%}, MeanLen: {mean_length:.1f}, Speed: {tok_sec:.2f} tok/sec", 
-                            file=sys.stderr)
-
-
-            if not config.get("raw_output", False):
-
-                if config.get("remove_thinking", False):
-
-                    # 1. Отрезаем пользовательский разделитель
-                    cut_prefix = config.get("answer_delimiter")
-                    if cut_prefix and cut_prefix in output:
-                        output = output.split(cut_prefix)[-1]
-
-                    # 2. Удаляем think-блоки
-                    output = re.sub(r'<think>.*?</think>', '', output, flags=re.DOTALL)
-                    if '</think>' in output:
-                        output = output.split('</think>')[-1]
-                        
-                    # 3. Удаляем channel-блоки
-                    output = re.sub(r'<\|channel>.*?<channel\|>', '', output, flags=re.DOTALL)
-                    if '<channel|>' in output:
-                        output = output.split('<channel|>')[-1]
-
-                    # 4. Схлопываем множественные пустые строки в одну
-                    output = re.sub(r'\n\s*\n+', '\n\n', output)    
-
-                # 5. Удаляем пустые строки в начале и конце
-                output = output.strip()
-
-            if config.get("debug_output", False):
-                print(f"[DEBUG] LLM output: {output}", file=sys.stderr)
-
-        elif extract_embedding:
-
-            tokenizer_path = config.get("tokenizer_path", "")
-            if tokenizer_path:
-                t_tok = time.perf_counter()
-                original_tokenize = current_cache["llm"].tokenize
-                try:
-                    from transformers import AutoTokenizer
-                    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
-
-                    def custom_tokenize(text: bytes, add_bos: bool = False, special: bool = False) -> list[int]:
-                        prompt_str = text.decode("utf-8")
-                        tokens = tokenizer.encode(prompt_str, add_special_tokens=False)
-                        #for key in tokens:
-                        #    print(f"key={key}", file=sys.stderr)
-                        return tokens
-
-                    current_cache["llm"].tokenize = custom_tokenize
-                except Exception as e:
-                    print(f"[WARNING] External tokenizer failed: {e}", file=sys.stderr)
-                    current_cache["llm"].tokenize = original_tokenize
-
-                _debug_print(debug, "connect external tokenizer", t_tok, file=sys.stderr)
-
-            t_emb = time.perf_counter()
-            try:
-                template_str = config.get("prompt_template", "")
-                if template_str:
-                    text_before, text_after = build_prompt(template_str, system=system_prompt, user=user_prompt)
-                    prompt = text_before + text_after
-                else:
-                    prompt = user_prompt            
-
-                #prompt = f"<|im_start|>user\nA red apple<|im_end|>\n<|im_start|>assistant\n"
-                #[151644,872,198,32,2518,23268,151645,198,151644,77091,198]
-
-                response = current_cache["llm"].create_embedding(prompt, normalize = -1)
-
-                emb = response['data'][0]['embedding']
-
-                if isinstance(emb, list):
-                    emb_np = np.array(emb, dtype=np.float32)
-                else:
-                    emb_np = np.array([emb], dtype=np.float32)
-                
-                scale = _norm_default(config.get("embedding_scale"), 1.0)
-                if scale is not None: 
-                    emb_np = (emb_np * scale).astype(np.float32)
-
-                output_data = emb_np
-                data_type = 1
-
-            except Exception as e:
-                print(f"[WARNING] Embedding extraction failed: {e}", file=sys.stderr)
-            _debug_print(debug, "get embedding", t_emb, file=sys.stderr)
-
-        elif extract_tts:
-
-            t_tts = time.perf_counter()
-
-            # 1. Инициализируем генератор аудио
-            audio_gen = MTMDAudioGenerator(
-                mmproj_path=mmproj_path, 
-                batch_max_tokens=config.get("mmproj_batch_max_tokens", 1024),
-                use_gpu=config.get("mmproj_use_gpu", True),
-                flash_attn=config.get("mmproj_flash_attn", True),
-            ) 
-             
-            # 2. Собираем аргументы для create_speech
-            tts_kwargs = {
-                "llama": current_cache["llm"],
-                "text": user_prompt,
-                "seed": config.get("seed", 42),
-                "max_frames": config.get("max_tokens", 2048),
-                "temperature": config.get("temperature", 0.7),
-                "repeat_penalty": config.get("repeat_penalty", 1.1),
-                "top_p": config.get("top_p", 0.92),
-                "min_p": config.get("min_p", 0.05),
-                "top_k": config.get("top_k", 0),
-            }
-         
-            # Опциональные параметры из конфига
-            language = config.get("language", "").strip()
-            if language:
-                tts_kwargs["language"] = language
-
-            if audios:        
-                for aud_item in audios:
-                    if aud_item is not None:
-                        tts_kwargs["speaker_reference"] = aud_item
-                        break    
-
-            # 3. Запускаем генерацию
-            generated_audio = audio_gen.create_speech(**tts_kwargs)
-
-            # 4. Проверка результата
-            if generated_audio.finish_reason == "length":
-                print("[WARNING] Audio has been cut off (max_frames limit reached)")
-             
-            # 5. Извлекаем байты (находятся в атрибуте .data)         
-            output_data = generated_audio.data
-            data_type = 2 # это аудио
-            _debug_print(debug, "get tts", t_tts, file=sys.stderr)
-
-        return {"status": "success", "output": output, "data_type": data_type}, output_data
+            else:
+                return _infer_chat(current_cache["llm"], config, images=images, audios=audios, videos=videos)
 
     except Exception as e:
         return {
