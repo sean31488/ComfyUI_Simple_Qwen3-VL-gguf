@@ -34,8 +34,8 @@ app.registerExtension({
         app.api.fetchApi = async function(url, options) {
             const urlString = typeof url === "string" ? url : url?.url;
             
-            // Проверяем, что это вызов "Пылесоса"
-            if (urlString === "/free" || urlString?.endsWith("/free")) {
+            // Проверяем, что это вызов "Пылесоса" (или кнопки comfyui-memory-tools)
+            if (urlString === "/free" || urlString?.endsWith("/free") || urlString?.endsWith("/unload_models_now")) {
                 // НЕ используем await!
                 // Запускаем запрос в фоне, чтобы не блокировать оригинальный /free
                 // и не мешать другим расширениям в цепочке перехватчиков.
