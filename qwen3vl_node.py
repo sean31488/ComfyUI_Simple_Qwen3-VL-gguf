@@ -1455,7 +1455,8 @@ class SimpleQwen3VL_GGUF_Node:
             if mode == "subprocess":
                 config["streaming_mode"] = False
 
-            if (len(images_value) + len(audio_value) + len(video_value)) == 0:
+            # Only split the cache when a text-only run would load the model without mmproj
+            if (len(images_value) + len(audio_value) + len(video_value)) == 0 and not config.get("force_mmproj", True):
                 config["content_count"] = 0
 
             raw_system_prompt = ""
