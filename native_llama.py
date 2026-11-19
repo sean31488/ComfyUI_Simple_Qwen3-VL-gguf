@@ -1,4 +1,4 @@
-# utils.py
+# native_llama.py
 # Native llama.cpp server adapter for KLL535/ComfyUI_Simple_Qwen3-VL-gguf.
 # Exposes a small llama-cpp-python-compatible Llama surface while running
 # a local upstream llama-server process.

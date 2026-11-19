@@ -1190,7 +1190,7 @@ def _load_llm(config, is_vision_model):
     t_first_import = time.perf_counter()
 
     if use_native_llamacpp:
-        from utils import Llama
+        from native_llama import Llama
     else:
         from llama_cpp import Llama
 
@@ -1814,7 +1814,7 @@ def _inference(config):
         is_multimodal_embedding = config.get("extract_multimodal_embedding", False)
         is_tts = config.get("extract_tts", False)
 
-        # Native llama-server backend (utils.Llama adapter)
+        # Native llama-server backend (native_llama.Llama adapter)
         llama_server_url = config.get("llama_server_url")
         use_native_llamacpp = bool(config.get("llama_server_path") or llama_server_url) and not is_tts
         config["_native_llamacpp"] = use_native_llamacpp
