@@ -223,13 +223,32 @@ class Llama:
             self._base_url = str(llama_server_url).rstrip("/")
             return
 
-        self._exe = self._resolve_server_executable(native_config.get("llama_server_path"))
         self._host = "127.0.0.1"
         self._port = int(llama_server_port) if llama_server_port else self._find_free_port()
         self._base_url = f"http://{self._host}:{self._port}"
 
+        # PolyStrata's run config (terminal/strata-<model>.json) owns the model,
+        # context and VRAM settings; its venv and server sit next to it.
+        polystrata_config = native_config.get("polystrata_config")
+        if polystrata_config:
+            root = Path(polystrata_config).expanduser().resolve().parent
+            self._start(
+                [
+                    str(root / ".venv" / "Scripts" / "python.exe"),
+                    str(root / "serve" / "server.py"),
+                    "--engine", "strata",
+                    "--config", str(Path(polystrata_config).expanduser()),
+                    "--port", str(self._port),
+                ],
+                root,
+                float(llama_server_start_timeout),
+            )
+            return
+
+        exe = self._resolve_server_executable(native_config.get("llama_server_path"))
+
         cmd: List[str] = [
-            self._exe,
+            exe,
             "--host", self._host,
             "--port", str(self._port),
             "--model", self.model_path,
@@ -298,11 +317,14 @@ class Llama:
         # widgets for them. Prefer a JSON list; strings are also accepted.
         cmd.extend(self._normalize_extra_args(llama_server_extra_args))
 
+        self._start(cmd, Path(exe).parent, float(llama_server_start_timeout))
+
+    def _start(self, cmd: List[str], cwd: Path, timeout: float) -> None:
         if self.verbose:
             print("[native-llama.cpp] " + subprocess.list2cmdline(cmd), file=sys.stderr)
 
         popen_kwargs: Dict[str, Any] = {
-            "cwd": str(Path(self._exe).parent),
+            "cwd": str(cwd),
         }
         if os.name == "nt":
             creation = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -326,7 +348,7 @@ class Llama:
 
         atexit.register(self.close)
         try:
-            self._wait_until_ready(float(llama_server_start_timeout))
+            self._wait_until_ready(timeout)
         except Exception:
             # Otherwise the server keeps running (and holding VRAM) while the
             # half-built object stays alive through the atexit registration.
@@ -436,10 +458,15 @@ class Llama:
         if proc is None or proc.poll() is not None:
             return
 
-        # On Windows terminate() is TerminateProcess, and llama-server spawns
-        # no children of its own, so there is nothing to walk.
+        # On Windows terminate() is TerminateProcess, which would leave children
+        # such as PolyStrata's engine holding VRAM until ComfyUI exits, so end
+        # the whole tree. llama-server has no children; elsewhere SIGTERM is
+        # enough, PolyStrata stops its engine on it.
         try:
-            proc.terminate()
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+            else:
+                proc.terminate()
             proc.wait(timeout=8)
         except Exception:
             try:

@@ -1816,7 +1816,7 @@ def _inference(config):
 
         # Native llama-server backend (native_llama.Llama adapter)
         llama_server_url = config.get("llama_server_url")
-        use_native_llamacpp = bool(config.get("llama_server_path") or llama_server_url) and not is_tts
+        use_native_llamacpp = bool(config.get("llama_server_path") or llama_server_url or config.get("polystrata_config")) and not is_tts
         config["_native_llamacpp"] = use_native_llamacpp
         if use_native_llamacpp and config.get("streaming_mode", False):
             print("[native-llama.cpp] streaming_mode is not supported, disabled", file=sys.stderr)
