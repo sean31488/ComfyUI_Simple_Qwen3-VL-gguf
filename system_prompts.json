@@ -13,10 +13,10 @@
     },
     "_user_prompt_template": {},
     "_user_prompt_styles": {
-        "🎨 照片級寫實 (以全片幅單眼質感呈現自然光、細緻皮膚與布料紋理及淺景深的寫實攝影)": "Transform style to \"photorealistic high-resolution photography with natural lighting, accurate skin textures, detailed fabric folds, and shallow depth of field, captured on a full-frame DSLR camera.\"",
-        "⚡ 角色｜動作角色 (捕捉動作巔峰瞬間，加入拖曳動態模糊與衣物髮絲的真實反應)": "Transform style to \"dynamic action shot capturing peak movement moment with motion blur on trailing elements, realistic clothing/hair response, and specified camera angle and focus\".",
-        "🎥 角色｜電影感角色 (以電影級質感呈現角色，搭配有光源依據的打光、淺景深、空氣微粒與電影調色)": "Transform style to \"cinematic character shot with film-quality production values, precise motivated lighting, shallow depth of field, atmospheric particles, and cinematic color grading\".",
-        "🖼️ 基礎 (呈現光線均衡、色彩準確、對焦銳利且細節豐富的中性專業畫面)": "Transform style to \"highly detailed, neutral, professional image with balanced lighting, accurate colors, and sharp focus.\""
+        "🎨 照片級寫實 (全片幅單眼質感，自然光，皮膚布料細節，淺景深)": "Transform style to \"photorealistic high-resolution photography with natural lighting, accurate skin textures, detailed fabric folds, and shallow depth of field, captured on a full-frame DSLR camera.\"",
+        "⚡ 動作角色 (動作巔峰瞬間，動態模糊，衣物髮絲隨動作飄動)": "Transform style to \"dynamic action shot capturing peak movement moment with motion blur on trailing elements, realistic clothing/hair response, and specified camera angle and focus\".",
+        "🎥 電影感角色 (有光源依據的打光，淺景深，空氣微粒，電影調色)": "Transform style to \"cinematic character shot with film-quality production values, precise motivated lighting, shallow depth of field, atmospheric particles, and cinematic color grading\".",
+        "🖼️ 基礎 (光線均衡，色彩準確，對焦銳利，細節豐富)": "Transform style to \"highly detailed, neutral, professional image with balanced lighting, accurate colors, and sharp focus.\""
     },
     "_camera_preset": {
         "🎬 電影感望遠特寫 (135mm｜背景壓縮最強、散景極淺、乾淨無噪)": "Transform this exact scene using the following camera transformation: Replace camera settings with: Sony A1 + FE 135mm f/1.8 GM – ISO 100, f/2.2, 1/250s. Visually, this means: tightly framed subject with strong background compression, ultra-smooth bokeh, tack-sharp eyes, and pristine low-noise rendering reminiscent of high-end editorial photography.",
